@@ -74,7 +74,7 @@ Recording runs on its own thread and never delays the live preview; if the encod
 
 ## Releases and updates
 
-Download the latest build from GitHub Releases (macOS Apple Silicon `.zip`, Windows `.zip`, Linux `.tar.gz`); each bundles its own FFmpeg. On first launch, macOS warns that the app is from an unidentified developer (it's self-signed): right-click it and choose Open once.
+Download the latest build from GitHub Releases (macOS Apple Silicon `.zip`, Windows `.zip`, Linux `.tar.gz`); each bundles its own FFmpeg. On first launch, macOS blocks the app because it isn't notarized (it's self-signed): open **System Settings → Privacy & Security** and click **Open Anyway** next to the Frameback message. Later updates install without asking again.
 
 On launch, Frameback checks for a newer release. **Update to vX** downloads it and checks it against the release's `SHA256SUMS`; **Restart to update** quits, swaps in the new version and reopens. It never updates while recording, and builds run from `cargo run` never update. Pre-releases (tags like `v1.2.0-rc.1`) aren't offered.
 
