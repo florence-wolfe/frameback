@@ -1,0 +1,46 @@
+[package]
+name = "frameback"
+version = "0.1.0"
+edition = "2024"
+description = "Low-latency capture card viewer with DVR rewind and frame-exact clips"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/florence-wolfe/frameback"
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+ffmpeg-next = "9"
+futures = "0.3"
+gpui = "0.2.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ringbuf = "0.6.0"
+serde_json = "1"
+sha2 = "0.11"
+ureq = "3"
+
+# AVFoundation capture backend (nokhwa's macOS backend mislabels pixel formats).
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
+# Compile Metal shaders at startup so building doesn't need Xcode's separate Metal Toolchain.
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-av-foundation = { version = "0.3", features = ["block2", "dispatch2", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
+objc2-core-foundation = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-foundation = "0.3"
+
+# MediaFoundation (Windows) and V4L2 (Linux) capture.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nokhwa = { version = "0.10.11", default-features = false, features = ["input-native", "decoding"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# MJPEG decoding and rendering live in dependencies; keep them fast in debug builds.
+[profile.dev.package."*"]
+opt-level = 2

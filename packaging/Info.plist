@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Frameback</string>
+    <key>CFBundleDisplayName</key>
+    <string>Frameback</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.florence-wolfe.frameback</string>
+    <key>CFBundleExecutable</key>
+    <string>frameback</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <!-- Without these, macOS stops the app the moment it asks for the device. -->
+    <key>NSCameraUsageDescription</key>
+    <string>Frameback shows and records video from your capture card or camera.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Frameback plays and records audio from your capture card.</string>
+</dict>
+</plist>

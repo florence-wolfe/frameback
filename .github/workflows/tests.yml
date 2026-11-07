@@ -1,0 +1,26 @@
+# Builds and unit-tests Frameback on macOS, Windows and Linux. Also run by the
+# release workflow before anything is built for publishing.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ffmpeg
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      # Integration tests need capture devices and are #[ignore]d
+      - run: cargo test --locked

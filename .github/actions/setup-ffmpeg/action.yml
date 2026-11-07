@@ -1,0 +1,48 @@
+# FFmpeg 9 libraries and headers for building (and bundling) Frameback.
+# macOS: Homebrew. Windows/Linux: BtbN's shared builds, checked against their checksums.
+name: Set up FFmpeg
+runs:
+  using: composite
+  steps:
+    - name: Install FFmpeg (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install ffmpeg
+
+    - name: Install build dependencies (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+          libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libvulkan-dev libv4l-dev clang
+
+    - name: Download FFmpeg (Windows, Linux)
+      if: runner.os != 'macOS'
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Windows) asset=ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip ;;
+          Linux) asset=ffmpeg-n9.0-latest-linux64-gpl-shared-9.0.tar.xz ;;
+        esac
+        base=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
+        cd "$RUNNER_TEMP"
+        curl -fsSL -o "$asset" "$base/$asset"
+        curl -fsSL -o checksums.sha256 "$base/checksums.sha256"
+        grep " $asset\$" checksums.sha256 | sha256sum -c -
+        mkdir ffmpeg
+        case "$RUNNER_OS" in
+          Windows) 7z x -offmpeg "$asset" > /dev/null ;;
+          Linux) tar -xJf "$asset" -C ffmpeg ;;
+        esac
+        dir=$(find "$RUNNER_TEMP/ffmpeg" -mindepth 1 -maxdepth 1 -type d)
+        if [ "$RUNNER_OS" = Windows ]; then dir=$(cygpath -w "$dir"); fi
+        echo "FFMPEG_DIR=$dir" >> "$GITHUB_ENV"
+        # Tests run the binary in place, so it must find the libraries
+        if [ "$RUNNER_OS" = Windows ]; then
+          echo "$dir\\bin" >> "$GITHUB_PATH"
+          echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+        else
+          echo "LD_LIBRARY_PATH=$dir/lib" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$dir/lib/pkgconfig" >> "$GITHUB_ENV"
+        fi
