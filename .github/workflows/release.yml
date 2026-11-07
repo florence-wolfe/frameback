@@ -18,6 +18,8 @@ jobs:
   build:
     needs: test
     strategy:
+      # Build every platform even if one fails, to see all problems in one run
+      fail-fast: false
       matrix:
         include:
           - os: macos-26

@@ -6,7 +6,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${FFMPEG_DIR:?set FFMPEG_DIR to an FFmpeg 9 build}"
 
-RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,\$ORIGIN/lib" cargo build --release --locked
+# RPATH rather than the default RUNPATH: only RPATH also applies to the
+# libraries FFmpeg's own libraries load (e.g. libavdevice -> libavfilter).
+RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/lib" cargo build --release --locked
 
 out=dist/Frameback
 rm -rf "$out"
