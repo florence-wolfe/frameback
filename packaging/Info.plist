@@ -8,6 +8,8 @@
     <string>Frameback</string>
     <key>CFBundleIdentifier</key>
     <string>io.github.florence-wolfe.frameback</string>
+    <key>CFBundleIconFile</key>
+    <string>Frameback</string>
     <key>CFBundleExecutable</key>
     <string>frameback</string>
     <key>CFBundlePackageType</key>

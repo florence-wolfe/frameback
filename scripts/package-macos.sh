@@ -14,8 +14,9 @@ cargo build --release --locked
 
 app=dist/Frameback.app
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources"
 cp target/release/frameback "$app/Contents/MacOS/frameback"
+cp packaging/Frameback.icns "$app/Contents/Resources/Frameback.icns"
 sed "s/__VERSION__/$version/g" packaging/Info.plist > "$app/Contents/Info.plist"
 
 frameworks="$app/Contents/Frameworks"

@@ -12,6 +12,7 @@ out=dist/Frameback
 rm -rf "$out"
 mkdir -p "$out/lib"
 cp target/release/frameback "$out/frameback"
+cp packaging/icon.png "$out/frameback.png"
 cp -a "$FFMPEG_DIR"/lib/*.so* "$out/lib/"
 
 # Every FFmpeg library must resolve from the bundle.
