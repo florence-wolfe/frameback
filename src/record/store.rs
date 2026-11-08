@@ -286,12 +286,13 @@ impl StoreWriter {
 
 /// Deletes buffers left behind by frameback processes that were killed or crashed.
 /// A live buffer is written to continuously, so anything idle for two
-/// minutes is abandoned.
+/// minutes is abandoned, except this process's own: a frozen buffer under
+/// review (or kept while a file is imported) is idle but still in use.
 fn remove_stale_buffers() {
     let Ok(entries) = fs::read_dir(std::env::temp_dir()) else { return };
-    let stale_after = Duration::from_secs(120);
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("frameback-dvr-") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("frameback-dvr-") {
             continue;
         }
         // The folder's own time counts too: a new buffer's folder exists
@@ -303,11 +304,18 @@ fn remove_stale_buffers() {
             .filter_map(|f| f.metadata().ok()?.modified().ok())
             .chain(entry.metadata().ok().and_then(|m| m.modified().ok()))
             .max();
-        let idle = newest.and_then(|t| t.elapsed().ok()).unwrap_or(stale_after);
-        if idle >= stale_after {
+        let idle = newest.and_then(|t| t.elapsed().ok()).unwrap_or(Duration::MAX);
+        if is_abandoned(&name, idle) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Whether the buffer folder `name`, idle for `idle`, is left over from
+/// another process.
+fn is_abandoned(name: &str, idle: Duration) -> bool {
+    let ours = format!("frameback-dvr-{}-", std::process::id());
+    !name.starts_with(&ours) && idle >= Duration::from_secs(120)
 }
 
 pub struct StoreReader {
@@ -370,6 +378,18 @@ mod tests {
         let survived = dir.exists();
         let _ = fs::remove_dir_all(&dir);
         assert!(survived, "a fresh, empty buffer folder was deleted");
+    }
+
+    #[test]
+    fn this_processes_frozen_buffers_are_not_mistaken_for_abandoned_ones() {
+        // Reviewing freezes a buffer for as long as the user likes; an import
+        // creating its own buffer meanwhile must not delete it.
+        let ten_minutes = Duration::from_secs(600);
+        let ours = format!("frameback-dvr-{}-3", std::process::id());
+        assert!(!is_abandoned(&ours, ten_minutes), "this process's idle buffer");
+        // No process has this id (it's above every platform's maximum).
+        assert!(is_abandoned("frameback-dvr-4294967295-0", ten_minutes), "another process's idle buffer");
+        assert!(!is_abandoned("frameback-dvr-4294967295-0", Duration::from_secs(5)), "a buffer in use");
     }
 
     #[test]

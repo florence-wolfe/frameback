@@ -1,6 +1,8 @@
 mod audio;
 mod clipboard;
+mod download;
 mod record;
+mod text_input;
 mod update;
 mod ui;
 mod video;
@@ -10,6 +12,7 @@ use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOption
 fn main() {
     Application::new().run(|cx: &mut App| {
         ui::bind_keys(cx);
+        text_input::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(720.)), cx);
         cx.open_window(
             WindowOptions {

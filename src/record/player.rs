@@ -110,7 +110,7 @@ struct State {
     events: UnboundedSender<PlayerEvent>,
     stream: usize,
     decoder: decoder::Video,
-    scaler: Option<(scaling::Context, Pixel, u32, u32)>,
+    to_bgra: ToBgra,
     /// Frame on screen.
     shown: Option<i64>,
     /// Last packet fed to the decoder, if the decoder state follows on from it.
@@ -153,7 +153,7 @@ impl State {
             events,
             stream,
             decoder,
-            scaler: None,
+            to_bgra: ToBgra::default(),
             shown: None,
             decoded: None,
             playing: None,
@@ -303,38 +303,12 @@ impl State {
             }
         }
         let Some(frame) = last else { return Ok(()) };
-        let image = self.to_image(&frame)?;
+        let image = self.to_bgra.convert(&frame)?;
         self.shown = Some(target.pts);
         let time = self.seconds(target.pts);
         self.slot.show(LatestFrame { image, captured_at: None });
         let _ = self.events.unbounded_send(PlayerEvent::Frame { time });
         Ok(())
-    }
-
-    fn to_image(&mut self, frame: &frame::Video) -> Result<Arc<RenderImage>> {
-        let (format, width, height) = (frame.format(), frame.width(), frame.height());
-        if !self.scaler.as_ref().is_some_and(|(_, f, w, h)| (*f, *w, *h) == (format, width, height)) {
-            let scaler = scaling::Context::get(
-                format,
-                width,
-                height,
-                Pixel::BGRA,
-                width,
-                height,
-                scaling::Flags::BILINEAR | scaling::Flags::ACCURATE_RND,
-            )?;
-            self.scaler = Some((scaler, format, width, height));
-        }
-        let mut bgra = frame::Video::new(Pixel::BGRA, width, height);
-        self.scaler.as_mut().unwrap().0.run(frame, &mut bgra)?;
-        let row = width as usize * 4;
-        let stride = bgra.stride(0);
-        let mut pixels = Vec::with_capacity(row * height as usize);
-        for line in bgra.data(0).chunks(stride).take(height as usize) {
-            pixels.extend_from_slice(&line[..row]);
-        }
-        let image = RgbaImage::from_raw(width, height, pixels).context("frame size")?;
-        Ok(Arc::new(RenderImage::new([Frame::new(image)])))
     }
 
     /// Decodes audio up to `until` (session seconds) into the output queue.
@@ -358,6 +332,39 @@ impl State {
             audio.cursor = entry.pts + entry.duration;
         }
         Ok(())
+    }
+}
+
+/// Converts decoded frames to the BGRA images the UI shows, reusing the
+/// scaler while the frame format stays the same.
+#[derive(Default)]
+pub(super) struct ToBgra(Option<(scaling::Context, Pixel, u32, u32)>);
+
+impl ToBgra {
+    pub(super) fn convert(&mut self, frame: &frame::Video) -> Result<Arc<RenderImage>> {
+        let (format, width, height) = (frame.format(), frame.width(), frame.height());
+        if !self.0.as_ref().is_some_and(|(_, f, w, h)| (*f, *w, *h) == (format, width, height)) {
+            let scaler = scaling::Context::get(
+                format,
+                width,
+                height,
+                Pixel::BGRA,
+                width,
+                height,
+                scaling::Flags::BILINEAR | scaling::Flags::ACCURATE_RND,
+            )?;
+            self.0 = Some((scaler, format, width, height));
+        }
+        let mut bgra = frame::Video::new(Pixel::BGRA, width, height);
+        self.0.as_mut().unwrap().0.run(frame, &mut bgra)?;
+        let row = width as usize * 4;
+        let stride = bgra.stride(0);
+        let mut pixels = Vec::with_capacity(row * height as usize);
+        for line in bgra.data(0).chunks(stride).take(height as usize) {
+            pixels.extend_from_slice(&line[..row]);
+        }
+        let image = RgbaImage::from_raw(width, height, pixels).context("frame size")?;
+        Ok(Arc::new(RenderImage::new([Frame::new(image)])))
     }
 }
 
@@ -391,13 +398,13 @@ fn interleave(frame: &frame::Audio, channels: usize) -> Vec<f32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::record::codec::Codec;
     use crate::record::pipeline::tests::{read_number, synthetic_pipeline};
 
     /// Waits for the next frame event and returns the number drawn in it.
-    fn next_frame(
+    pub(crate) fn next_frame(
         events: &mut futures::channel::mpsc::UnboundedReceiver<PlayerEvent>,
         slot: &FrameSlot,
     ) -> u32 {

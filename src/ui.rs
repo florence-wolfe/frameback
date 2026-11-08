@@ -7,14 +7,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{
-    App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Hsla, IntoElement, MouseButton,
-    ObjectFit, Pixels, RenderImage, SharedString, Task, Window, actions, canvas, deferred, div,
-    img, prelude::*, px, rgb, rgba,
+    App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, Hsla,
+    IntoElement, MouseButton, ObjectFit, Pixels, RenderImage, SharedString, Task, Window, actions,
+    canvas, deferred, div, img, prelude::*, px, rgb, rgba,
 };
 
 use crate::audio::{self, AudioDevice, AudioTap, Monitor, Volume};
 use crate::update::{self, Release};
-use crate::record::{Codec, Pipeline, PipelineEvent, Player, PlayerEvent, Store, effective_fps};
+use crate::record::{
+    Codec, Import, ImportEvent, Pipeline, PipelineEvent, Player, PlayerEvent, Source, Store,
+    effective_fps,
+};
+use crate::text_input::TextInput;
 use crate::video::{self, Capture, FrameSlot, VideoDevice, VideoEvent, VideoFormat};
 
 actions!(
@@ -38,6 +42,10 @@ actions!(
         MarkStart,
         MarkEnd,
         SaveClip,
+        ImportClip,
+        ImportUrl,
+        SubmitUrl,
+        CancelUrl,
         Quit
     ]
 );
@@ -49,8 +57,10 @@ enum Menu {
     Video,
     Format,
     Audio,
-    Codec,
-    Dvr,
+    File,
+    View,
+    /// Codec and rewind buffer length.
+    Settings,
     Step,
 }
 
@@ -74,6 +84,31 @@ struct Dvr {
 
 struct Recording {
     started: Instant,
+}
+
+/// A video file reviewed in place of the live buffer. Dropping it cancels
+/// an import in progress and ignores its remaining events.
+struct Imported {
+    name: String,
+    /// Set once the file has been converted into a buffer.
+    store: Option<Store>,
+    /// Still downloading (from a URL), rather than converting.
+    downloading: bool,
+    progress: f32,
+    /// Where live review was when the import started, to go back to when
+    /// it's closed. None: it started from live, so closing goes live.
+    resume: Option<ReviewSpot>,
+    _import: Import,
+    _events: Task<()>,
+}
+
+/// A place in review of the live buffer, kept while a file is open instead.
+struct ReviewSpot {
+    time: f64,
+    range: (f64, f64),
+    editing_clip: bool,
+    clip_start: Option<f64>,
+    clip_end: Option<f64>,
 }
 
 /// Watching the past: a player shows buffered frames instead of live ones.
@@ -139,6 +174,10 @@ pub struct Frameback {
     dvr: Option<Dvr>,
     recording: Option<Recording>,
     timeshift: Option<Timeshift>,
+    /// While set, the live pipeline is stopped and the file is reviewed instead.
+    imported: Option<Imported>,
+    /// The "Import from URL" dialog, while open.
+    url_dialog: Option<Entity<TextInput>>,
     audio_tap: AudioTap,
     playback_slot: Arc<FrameSlot>,
     pipeline_events: UnboundedSender<PipelineEvent>,
@@ -248,6 +287,8 @@ impl Frameback {
             dvr: None,
             recording: None,
             timeshift: None,
+            imported: None,
+            url_dialog: None,
             audio_tap: AudioTap::default(),
             playback_slot: Arc::default(),
             pipeline_events,
@@ -296,8 +337,8 @@ impl Frameback {
                     .and_then(video::age)
                     .map(|d| d.as_secs_f32() * 1000.0);
                 self.count_frame(cx);
-                // In timeshift the live feed keeps recording but isn't shown.
-                if self.timeshift.is_none() {
+                // In timeshift (or with a file open) the live feed keeps recording but isn't shown.
+                if self.timeshift.is_none() && self.imported.is_none() {
                     self.display(latest.image);
                 }
                 cx.notify();
@@ -327,7 +368,7 @@ impl Frameback {
             self.stats.delivered = delivered;
             self.stats.since = Some(now);
             // The pipeline needs the real frame rate, so it starts after the first measurement.
-            if self.dvr.is_none() {
+            if self.dvr.is_none() && self.imported.is_none() {
                 self.start_pipeline(cx);
             }
         }
@@ -335,6 +376,10 @@ impl Frameback {
 
     /// True (and explains why) if `action` would discard the buffer being reviewed.
     fn blocked_in_review(&mut self, action: &str, cx: &mut Context<Self>) -> bool {
+        if self.imported.is_some() {
+            self.show_toast(format!("Close the imported file (L) before {action}"), cx);
+            return true;
+        }
         if self.timeshift.is_none() {
             return false;
         }
@@ -435,7 +480,7 @@ impl Frameback {
         self.hide_controls = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(CONTROLS_HIDE_AFTER).await;
             let _ = this.update(cx, |this, cx| {
-                if this.menu.is_none() && !this.toolbar_hovered {
+                if this.menu.is_none() && !this.toolbar_hovered && this.url_dialog.is_none() {
                     this.controls_visible = false;
                     cx.notify();
                 }
@@ -493,7 +538,11 @@ impl Frameback {
 
     /// Disconnects the pipeline's inputs; it then finalizes any recording and exits.
     fn detach_pipeline(&mut self) -> Option<Dvr> {
-        self.timeshift = None;
+        // An open file's review stays; there's just no live review to return to.
+        match &mut self.imported {
+            Some(imported) => imported.resume = None,
+            None => self.timeshift = None,
+        }
         self.recording = None;
         self.slot.set_tap(None);
         self.audio_tap.set(None);
@@ -557,6 +606,9 @@ impl Frameback {
         };
         if self.recording.take().is_some() {
             dvr.pipeline.stop_recording();
+        } else if self.imported.is_some() {
+            self.show_toast("Close the imported file (L) to start recording", cx);
+            return;
         } else if self.timeshift.is_some() {
             // Recording takes the live feed, not what's being reviewed.
             self.show_toast("Go LIVE (L) to start recording", cx);
@@ -582,10 +634,146 @@ impl Frameback {
         }
     }
 
+    // --- Importing files ---------------------------------------------------------
+
+    fn import_clip(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |this, cx| this.begin_import(Source::File(path), cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Opens the "Import from URL" dialog, filled in from the clipboard if it holds a link.
+    fn open_url_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self
+            .url_dialog
+            .get_or_insert_with(|| cx.new(|cx| TextInput::new("https://…", cx)))
+            .clone();
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        if let Some(url) = copied.map(|t| t.trim().to_string()).filter(|t| looks_like_url(t)) {
+            input.update(cx, |input, cx| input.set_text(url, cx));
+        }
+        window.focus(&input.focus_handle(cx));
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn close_url_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.url_dialog = None;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn submit_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = &self.url_dialog else { return };
+        let url = input.read(cx).text().trim().to_string();
+        if !looks_like_url(&url) {
+            self.show_toast("Enter a link starting with http:// or https://", cx);
+            return;
+        }
+        self.close_url_dialog(window, cx);
+        let into = output_dir(MOVIES_DIR);
+        self.begin_import(Source::Url { url, into }, cx);
+    }
+
+    /// Converts the source into a buffer to review. The live buffer is frozen
+    /// meanwhile (a recording carries on), and closing the file returns to it.
+    fn begin_import(&mut self, source: Source, cx: &mut Context<Self>) {
+        if self.recording.is_some() && self.timeshift.is_none() && self.imported.is_none() {
+            // Recording continues; it just isn't shown.
+            self.show_toast("Still recording the live feed while the file is open", cx);
+        }
+        // A new file replaces an open one, returning to the same place.
+        let resume = match self.imported.take() {
+            Some(previous) => {
+                self.timeshift = None;
+                previous.resume
+            }
+            None => self.timeshift.take().map(|ts| ReviewSpot {
+                time: ts.time,
+                range: ts.range,
+                editing_clip: ts.editing_clip,
+                clip_start: ts.clip_start,
+                clip_end: ts.clip_end,
+            }),
+        };
+        if let Some(dvr) = &self.dvr {
+            dvr.pipeline.set_frozen(true);
+        }
+        let (tx, mut rx) = unbounded();
+        let events = cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                if this.update(cx, |this, cx| this.on_import_event(event, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        let playback_rate = self.monitor.as_ref().map(|m| m.sample_rate);
+        let (name, downloading) = match &source {
+            Source::File(path) => (file_name(path), false),
+            Source::Url { url, .. } => (url.clone(), true),
+        };
+        self.imported = Some(Imported {
+            name,
+            store: None,
+            downloading,
+            progress: 0.0,
+            resume,
+            _import: Import::start(source, self.codec, playback_rate, tx),
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    fn on_import_event(&mut self, event: ImportEvent, cx: &mut Context<Self>) {
+        let Some(imported) = &mut self.imported else { return };
+        match event {
+            ImportEvent::Downloading(progress) => imported.progress = progress,
+            ImportEvent::Downloaded { path } => {
+                imported.name = file_name(&path);
+                imported.downloading = false;
+                imported.progress = 0.0;
+            }
+            ImportEvent::Progress(progress) => imported.progress = progress,
+            ImportEvent::Done { store } => {
+                let frames = store.frames_between(f64::MIN, f64::MAX);
+                let start = store.video_range().map(|(start, _)| start);
+                let message = format!("Imported {} ({frames} frames)", imported.name);
+                imported.store = Some(store);
+                self.enter_timeshift(start, cx);
+                self.show_toast(message, cx);
+            }
+            ImportEvent::Failed(err) => {
+                let message = format!("Importing {} failed: {err}", imported.name);
+                self.close_import(cx);
+                self.show_toast(message, cx);
+            }
+        }
+        cx.notify();
+    }
+
     // --- Timeshift ------------------------------------------------------------
 
+    /// The buffer being shown: the imported file's, or the live one.
+    fn store(&self) -> Option<&Store> {
+        match &self.imported {
+            Some(imported) => imported.store.as_ref(),
+            None => self.dvr.as_ref()?.store.as_ref(),
+        }
+    }
+
     fn buffered(&self) -> Option<(f64, f64)> {
-        self.dvr.as_ref()?.store.as_ref()?.video_range()
+        self.store()?.video_range()
     }
 
     /// Switches from live to the buffer, showing `time` (default: newest frame).
@@ -593,7 +781,7 @@ impl Frameback {
         if self.timeshift.is_some() {
             return true;
         }
-        let Some(store) = self.dvr.as_ref().and_then(|d| d.store.clone()) else { return false };
+        let Some(store) = self.store().cloned() else { return false };
         let Some(range) = store.video_range() else { return false };
         let audio = self.monitor.as_ref().map(|m| m.playback.clone());
         let player =
@@ -617,7 +805,36 @@ impl Frameback {
         true
     }
 
+    /// Closes (or cancels) an imported file, returning to live review where
+    /// it was left, or to live.
+    fn close_import(&mut self, cx: &mut Context<Self>) {
+        let Some(imported) = self.imported.take() else { return };
+        self.timeshift = None;
+        match imported.resume {
+            Some(spot) => {
+                if self.enter_timeshift(Some(spot.time), cx)
+                    && let Some(ts) = &mut self.timeshift
+                {
+                    ts.range = spot.range;
+                    ts.editing_clip = spot.editing_clip;
+                    ts.clip_start = spot.clip_start;
+                    ts.clip_end = spot.clip_end;
+                }
+            }
+            None => {
+                if let Some(dvr) = &self.dvr {
+                    dvr.pipeline.set_frozen(false);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn go_live(&mut self, cx: &mut Context<Self>) {
+        if self.imported.is_some() {
+            self.close_import(cx);
+            return;
+        }
         if self.timeshift.take().is_some() {
             if let Some(dvr) = &self.dvr {
                 dvr.pipeline.set_frozen(false);
@@ -678,9 +895,7 @@ impl Frameback {
         verb: &str,
         cx: &mut Context<Self>,
     ) -> Option<(PathBuf, Task<anyhow::Result<u64>>)> {
-        let (Some((from, to)), Some(store)) =
-            (self.clip_range(), self.dvr.as_ref().and_then(|d| d.store.clone()))
-        else {
+        let (Some((from, to)), Some(store)) = (self.clip_range(), self.store().cloned()) else {
             self.show_toast(format!("Open Clip (C) to {verb} a clip"), cx);
             return None;
         };
@@ -799,7 +1014,12 @@ impl Frameback {
                 if let Some(ts) = &mut self.timeshift {
                     ts.playing = false;
                 }
-                self.show_toast("End of buffer. Press L to go live", cx);
+                let message = if self.imported.is_some() {
+                    "End of file. Press L to close it"
+                } else {
+                    "End of buffer. Press L to go live"
+                };
+                self.show_toast(message, cx);
             }
             PlayerEvent::Error(err) => {
                 self.go_live(cx);
@@ -959,14 +1179,27 @@ const MOVIES_DIR: &str = if cfg!(target_os = "macos") { "Movies" } else { "Video
 
 /// `~/<folder>/<name>-<millis>.<ext>`, falling back to the home directory.
 fn output_path(folder: &str, name: &str, extension: &str) -> PathBuf {
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    output_dir(folder).join(format!("{name}-{millis}.{extension}"))
+}
+
+/// `~/<folder>`, falling back to the home directory.
+fn output_dir(folder: &str) -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_default();
     let preferred = home.join(folder);
-    let dir = if preferred.is_dir() { preferred } else { home };
-    let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-    dir.join(format!("{name}-{millis}.{extension}"))
+    if preferred.is_dir() { preferred } else { home }
+}
+
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+fn looks_like_url(text: &str) -> bool {
+    (text.starts_with("https://") || text.starts_with("http://")) && !text.contains(char::is_whitespace)
 }
 
 pub(crate) fn save_png(frame: &RenderImage, path: &std::path::Path) -> anyhow::Result<()> {
@@ -1042,7 +1275,7 @@ impl Render for Frameback {
         }
         self.to_free = std::mem::take(&mut self.retired);
 
-        let hide_cursor = !self.controls_visible && self.menu.is_none();
+        let hide_cursor = !self.controls_visible && self.menu.is_none() && self.url_dialog.is_none();
 
         div()
             .id("root")
@@ -1066,6 +1299,10 @@ impl Render for Frameback {
             .on_action(cx.listener(|this, _: &SaveClip, _, cx| this.save_clip(cx)))
             .on_action(cx.listener(|this, _: &CopyClip, _, cx| this.copy_clip(cx)))
             .on_action(cx.listener(|this, _: &CopyFrame, _, cx| this.copy_frame(cx)))
+            .on_action(cx.listener(|this, _: &ImportClip, _, cx| this.import_clip(cx)))
+            .on_action(cx.listener(|this, _: &ImportUrl, window, cx| this.open_url_dialog(window, cx)))
+            .on_action(cx.listener(|this, _: &SubmitUrl, window, cx| this.submit_url(window, cx)))
+            .on_action(cx.listener(|this, _: &CancelUrl, window, cx| this.close_url_dialog(window, cx)))
             .on_mouse_move(cx.listener(|this, _, _, cx| this.reveal_controls(cx)))
             .relative()
             .size_full()
@@ -1104,6 +1341,7 @@ impl Render for Frameback {
             .when(self.controls_visible || self.menu.is_some() || self.timeshift.is_some(), |d| {
                 d.child(self.render_toolbar(cx))
             })
+            .children(self.url_dialog.clone().map(|input| self.render_url_dialog(input, cx)))
     }
 }
 
@@ -1137,6 +1375,65 @@ impl Frameback {
             .child(content)
     }
 
+    fn render_url_dialog(&self, input: Entity<TextInput>, cx: &mut Context<Self>) -> impl IntoElement {
+        let folder = output_dir(MOVIES_DIR).display().to_string();
+        let panel = div()
+            .id("url-dialog")
+            .occlude()
+            .w(px(520.))
+            .max_w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .bg(panel_bg())
+            .border_1()
+            .border_color(border())
+            .shadow_lg()
+            .child(div().font_weight(gpui::FontWeight::BOLD).child("Import from URL"))
+            .child(input)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_text())
+                    .child(format!("Downloaded with yt-dlp into {folder}, then opened for review.")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(button("url-cancel", "Cancel").on_click(
+                        cx.listener(|this, _, window, cx| this.close_url_dialog(window, cx)),
+                    ))
+                    .child(
+                        button("url-import", "Download & import")
+                            .bg(accent())
+                            .text_color(gpui::black())
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit_url(window, cx))),
+                    ),
+            );
+        deferred(
+            div()
+                .id("url-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_4()
+                .bg(rgba(0x00000080))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_url_dialog(window, cx)),
+                )
+                .child(panel),
+        )
+        .with_priority(3)
+    }
+
     fn render_stats(&self) -> impl IntoElement {
         let format = self.active_format.as_ref().map(VideoFormat::label).unwrap_or_default();
         let latency = match self.stats.latency_ms {
@@ -1154,7 +1451,7 @@ impl Frameback {
                 self.slot.tap_dropped()
             )
         });
-        let buffer = self.dvr.as_ref().and_then(|d| d.store.as_ref()).map(|store| {
+        let buffer = self.store().map(|store| {
             let span = store.video_range().map_or(0.0, |(a, b)| b - a);
             format!("dvr {} · {}", format_time(span), format_bytes(store.bytes()))
         });
@@ -1202,11 +1499,6 @@ impl Frameback {
             None => "● Rec".into(),
         };
 
-        let dvr_label = match self.dvr.as_ref().and_then(|d| d.store.as_ref()) {
-            Some(store) => format!("DVR {} min · {}", self.dvr_window_min, format_bytes(store.bytes())),
-            None => format!("DVR {} min", self.dvr_window_min),
-        };
-
         div()
             .id("controls")
             .absolute()
@@ -1247,8 +1539,6 @@ impl Frameback {
                                 window.dispatch_action(Box::new(ToggleRecord), cx)
                             })),
                     )
-                    .child(self.menu_button(Menu::Codec, "codec", self.codec.label(), cx))
-                    .child(self.menu_button(Menu::Dvr, "dvr", dvr_label, cx))
                     .child(separator())
                     .child(self.menu_button(Menu::Video, "video", video_label, cx))
                     .child(self.menu_button(Menu::Format, "format", format_label, cx))
@@ -1262,19 +1552,9 @@ impl Frameback {
                             })),
                     )
                     .child(separator())
-                    .child(
-                        button("stats", "Stats")
-                            .when(self.show_stats, |b| b.text_color(accent()))
-                            .on_click(cx.listener(|_, _, window, cx| {
-                                window.dispatch_action(Box::new(ToggleStats), cx)
-                            })),
-                    )
-                    .child(button("shot", "Screenshot").on_click(cx.listener(
-                        |_, _, window, cx| window.dispatch_action(Box::new(Screenshot), cx),
-                    )))
-                    .child(button("full", "Fullscreen").on_click(cx.listener(
-                        |_, _, window, _| window.toggle_fullscreen(),
-                    )))
+                    .child(self.menu_button(Menu::File, "file", "File", cx))
+                    .child(self.menu_button(Menu::View, "view", "View", cx))
+                    .child(self.menu_button(Menu::Settings, "settings", "Settings", cx))
                     .children(self.update.as_ref().map(|update| {
                         let (label, ready) = match update {
                             Update::Available(r) => (format!("Update to v{}", r.version), true),
@@ -1292,15 +1572,22 @@ impl Frameback {
     /// LIVE or REVIEW, top centre. Review is always shown; live only with the controls.
     fn render_mode_badge(&self) -> Option<impl IntoElement> {
         let review = self.timeshift.is_some();
-        if !review && !(self.controls_visible && self.dvr.is_some()) {
+        let imported = self.imported.as_ref();
+        if !review && imported.is_none() && !(self.controls_visible && self.dvr.is_some()) {
             return None;
         }
+        let source = imported.map_or("buffer paused".to_string(), |i| i.name.clone());
         let (color, mode, detail) = if self.editing_clip() {
-            (accent(), "CLIP", "buffer paused · Esc to close")
+            (accent(), "CLIP", format!("{source} · Esc to close"))
         } else if review {
-            (review_amber(), "REVIEW", "buffer paused · L to go live")
+            let close = if imported.is_some() { "L to close" } else { "L to go live" };
+            (review_amber(), "REVIEW", format!("{source} · {close}"))
+        } else if let Some(imported) = imported {
+            let percent = (imported.progress * 100.0).round();
+            let phase = if imported.downloading { "downloading" } else { "converting" };
+            (review_amber(), "IMPORT", format!("{source} · {phase} {percent}% · L to cancel"))
         } else {
-            (recording_red(), "● LIVE", "buffering")
+            (recording_red(), "● LIVE", "buffering".to_string())
         };
         Some(
             div().absolute().top_3().left_0().right_0().flex().justify_center().child(
@@ -1532,15 +1819,12 @@ impl Frameback {
         let origin = self.timeline_range().map_or(0.0, |r| r.0);
         let mark = |t: Option<f64>| t.map_or("—".to_string(), |t| format_precise(t - origin));
         let summary = self.clip_range().map(|(a, b)| {
-            let frames = self
-                .dvr
-                .as_ref()
-                .and_then(|d| d.store.as_ref())
-                .map_or(0, |store| store.frames_between(a, b));
+            let frames = self.store().map_or(0, |store| store.frames_between(a, b));
             let whole = start.is_none() && end.is_none();
+            let whole_label = if self.imported.is_some() { "whole file · " } else { "whole buffer · " };
             format!(
                 "{}{} · {frames} frames",
-                if whole { "whole buffer · " } else { "" },
+                if whole { whole_label } else { "" },
                 format_precise(b - a)
             )
         });
@@ -1602,90 +1886,63 @@ impl Frameback {
     }
 
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
-        let items: Vec<(SharedString, bool, Box<dyn Fn(&mut Self, &mut Context<Self>)>)> =
-            match menu {
-                Menu::Video => self
-                    .video_devices
-                    .iter()
-                    .enumerate()
-                    .map(|(i, d)| {
-                        (
-                            d.name.clone().into(),
-                            self.video_selected == Some(i),
-                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
-                                this.select_video(i, cx)
-                            }) as Box<dyn Fn(&mut Self, &mut Context<Self>)>,
-                        )
-                    })
-                    .collect(),
-                Menu::Format => self
-                    .formats
-                    .iter()
-                    .map(|f| {
-                        let f = f.clone();
-                        (
-                            f.label().into(),
-                            self.active_format.as_ref() == Some(&f),
-                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
-                                this.select_format(f.clone(), cx)
-                            }) as Box<dyn Fn(&mut Self, &mut Context<Self>)>,
-                        )
-                    })
-                    .collect(),
-                Menu::Codec => Codec::ALL
-                    .iter()
-                    .map(|&codec| {
-                        (
-                            format!("{} (.{})", codec.label(), codec.extension()).into(),
-                            self.codec == codec,
-                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
-                                this.select_codec(codec, cx)
-                            }) as Box<dyn Fn(&mut Self, &mut Context<Self>)>,
-                        )
-                    })
-                    .collect(),
-                Menu::Step => STEP_SIZES
-                    .iter()
-                    .map(|&n| {
-                        (
-                            format!("Step {n} frame{}", if n == 1 { "" } else { "s" }).into(),
-                            self.step_frames == n,
-                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
-                                this.step_frames = n;
-                                cx.notify();
-                            }) as Box<dyn Fn(&mut Self, &mut Context<Self>)>,
-                        )
-                    })
-                    .collect(),
-                Menu::Dvr => DVR_WINDOWS_MIN
-                    .iter()
-                    .map(|&minutes| {
-                        (
-                            format!("Keep the last {minutes} min").into(),
-                            self.dvr_window_min == minutes,
-                            Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
-                                this.select_dvr_window(minutes, cx)
-                            }) as Box<dyn Fn(&mut Self, &mut Context<Self>)>,
-                        )
-                    })
-                    .collect(),
-                Menu::Audio => std::iter::once((
-                    SharedString::from("Off"),
-                    self.audio_selected.is_none(),
-                    Box::new(|this: &mut Self, cx: &mut Context<Self>| this.select_audio(None, cx))
-                        as Box<dyn Fn(&mut Self, &mut Context<Self>)>,
-                ))
+        let rows: Vec<MenuRow> = match menu {
+            Menu::Video => self
+                .video_devices
+                .iter()
+                .enumerate()
+                .map(|(i, d)| choice(d.name.clone(), self.video_selected == Some(i), move |this, cx| this.select_video(i, cx)))
+                .collect(),
+            Menu::Format => self
+                .formats
+                .iter()
+                .map(|f| {
+                    let f = f.clone();
+                    let selected = self.active_format.as_ref() == Some(&f);
+                    choice(f.label(), selected, move |this, cx| this.select_format(f.clone(), cx))
+                })
+                .collect(),
+            Menu::Audio => std::iter::once(choice("Off", self.audio_selected.is_none(), |this, cx| this.select_audio(None, cx)))
                 .chain(self.audio_devices.iter().enumerate().map(|(i, d)| {
-                    (
-                        d.name.clone().into(),
-                        self.audio_selected == Some(i),
-                        Box::new(move |this: &mut Self, cx: &mut Context<Self>| {
-                            this.select_audio(Some(i), cx)
-                        }) as Box<dyn Fn(&mut Self, &mut Context<Self>)>,
-                    )
+                    choice(d.name.clone(), self.audio_selected == Some(i), move |this, cx| this.select_audio(Some(i), cx))
                 }))
                 .collect(),
-            };
+            Menu::File => vec![
+                command("Import file…", shortcut("O", false), ImportClip),
+                command("Import from URL…", shortcut("O", true), ImportUrl),
+                command("Screenshot", Some("S".into()), Screenshot),
+            ],
+            Menu::View => vec![
+                MenuRow::Item {
+                    label: "Stats".into(),
+                    selected: self.show_stats,
+                    shortcut: Some("I".into()),
+                    action: Box::new(|_, window, cx| window.dispatch_action(Box::new(ToggleStats), cx)),
+                },
+                command("Fullscreen", Some("F".into()), ToggleFullscreen),
+            ],
+            Menu::Settings => std::iter::once(MenuRow::Header("Codec"))
+                .chain(Codec::ALL.iter().map(|&codec| {
+                    let label = format!("{} (.{})", codec.label(), codec.extension());
+                    choice(label, self.codec == codec, move |this, cx| this.select_codec(codec, cx))
+                }))
+                .chain([MenuRow::Header("Rewind buffer")])
+                .chain(DVR_WINDOWS_MIN.iter().map(|&minutes| {
+                    let label = format!("Keep the last {minutes} min");
+                    choice(label, self.dvr_window_min == minutes, move |this, cx| this.select_dvr_window(minutes, cx))
+                }))
+                .collect(),
+            Menu::Step => STEP_SIZES
+                .iter()
+                .map(|&n| {
+                    let label = format!("Step {n} frame{}", if n == 1 { "" } else { "s" });
+                    choice(label, self.step_frames == n, move |this, cx| {
+                        this.step_frames = n;
+                        cx.notify();
+                    })
+                })
+                .collect(),
+        };
 
         div()
             .id("menu")
@@ -1704,11 +1961,19 @@ impl Frameback {
             .shadow_lg()
             .flex()
             .flex_col()
-            .when(items.is_empty(), |d| {
+            .when(rows.is_empty(), |d| {
                 d.child(div().px_2().py_1().text_color(muted_text()).child("Nothing available"))
             })
-            .children(items.into_iter().enumerate().map(|(i, (label, selected, action))| {
-                div()
+            .children(rows.into_iter().enumerate().map(|(i, row)| match row {
+                MenuRow::Header(title) => div()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(muted_text())
+                    .child(title)
+                    .into_any_element(),
+                MenuRow::Item { label, selected, shortcut, action } => div()
                     .id(("item", i))
                     .flex()
                     .items_center()
@@ -1724,13 +1989,63 @@ impl Frameback {
                             .text_color(accent())
                             .child(if selected { "●" } else { "" }),
                     )
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .child(div().flex_1().child(label))
+                    .children(shortcut.map(|keys| div().pl_4().text_color(muted_text()).child(keys)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.menu = None;
-                        action(this, cx);
+                        action(this, window, cx);
                     }))
+                    .into_any_element(),
             }))
     }
+}
+
+type MenuAction = Box<dyn Fn(&mut Frameback, &mut Window, &mut Context<Frameback>)>;
+
+/// A row in a dropdown menu.
+enum MenuRow {
+    Header(&'static str),
+    Item {
+        label: SharedString,
+        /// Shows a dot: the current choice, or a setting that's on.
+        selected: bool,
+        shortcut: Option<String>,
+        action: MenuAction,
+    },
+}
+
+/// One of a set of options, the current one marked.
+fn choice(
+    label: impl Into<SharedString>,
+    selected: bool,
+    action: impl Fn(&mut Frameback, &mut Context<Frameback>) + 'static,
+) -> MenuRow {
+    MenuRow::Item {
+        label: label.into(),
+        selected,
+        shortcut: None,
+        action: Box::new(move |this, _, cx| action(this, cx)),
+    }
+}
+
+/// Runs `action`, exactly as its keyboard shortcut does.
+fn command(label: &'static str, shortcut: Option<String>, action: impl gpui::Action) -> MenuRow {
+    MenuRow::Item {
+        label: label.into(),
+        selected: false,
+        shortcut,
+        action: Box::new(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx)),
+    }
+}
+
+/// How the platform writes Cmd/Ctrl (+ Shift) + `key`.
+fn shortcut(key: &str, shift: bool) -> Option<String> {
+    Some(match (cfg!(target_os = "macos"), shift) {
+        (true, false) => format!("⌘{key}"),
+        (true, true) => format!("⇧⌘{key}"),
+        (false, false) => format!("Ctrl+{key}"),
+        (false, true) => format!("Ctrl+Shift+{key}"),
+    })
 }
 
 fn button(id: &'static str, label: impl Into<SharedString>) -> gpui::Stateful<gpui::Div> {
@@ -1815,26 +2130,33 @@ fn render_toast(message: SharedString) -> impl IntoElement {
 
 pub fn bind_keys(cx: &mut App) {
     use gpui::KeyBinding;
+    // Not while typing in a text field, where these keys are text or editing.
+    let app = Some("!TextInput");
+    let field = Some("TextInput");
     cx.bind_keys([
-        KeyBinding::new("f", ToggleFullscreen, None),
-        KeyBinding::new("escape", ExitFullscreen, None),
-        KeyBinding::new("s", Screenshot, None),
-        KeyBinding::new("m", ToggleMute, None),
-        KeyBinding::new("i", ToggleStats, None),
-        KeyBinding::new("r", ToggleRecord, None),
-        KeyBinding::new("space", TogglePlay, None),
-        KeyBinding::new("left", StepBack, None),
-        KeyBinding::new("right", StepForward, None),
-        KeyBinding::new("shift-left", JumpBack, None),
-        KeyBinding::new("shift-right", JumpForward, None),
-        KeyBinding::new("l", GoLive, None),
-        KeyBinding::new("end", GoLive, None),
-        KeyBinding::new("c", ToggleClipMode, None),
-        KeyBinding::new("[", MarkStart, None),
-        KeyBinding::new("]", MarkEnd, None),
-        KeyBinding::new("secondary-s", SaveClip, None),
-        KeyBinding::new("secondary-c", CopyClip, None),
-        KeyBinding::new("secondary-shift-c", CopyFrame, None),
+        KeyBinding::new("f", ToggleFullscreen, app),
+        KeyBinding::new("escape", ExitFullscreen, app),
+        KeyBinding::new("s", Screenshot, app),
+        KeyBinding::new("m", ToggleMute, app),
+        KeyBinding::new("i", ToggleStats, app),
+        KeyBinding::new("r", ToggleRecord, app),
+        KeyBinding::new("space", TogglePlay, app),
+        KeyBinding::new("left", StepBack, app),
+        KeyBinding::new("right", StepForward, app),
+        KeyBinding::new("shift-left", JumpBack, app),
+        KeyBinding::new("shift-right", JumpForward, app),
+        KeyBinding::new("l", GoLive, app),
+        KeyBinding::new("end", GoLive, app),
+        KeyBinding::new("c", ToggleClipMode, app),
+        KeyBinding::new("[", MarkStart, app),
+        KeyBinding::new("]", MarkEnd, app),
+        KeyBinding::new("secondary-s", SaveClip, app),
+        KeyBinding::new("secondary-c", CopyClip, app),
+        KeyBinding::new("secondary-shift-c", CopyFrame, app),
+        KeyBinding::new("secondary-o", ImportClip, app),
+        KeyBinding::new("secondary-shift-o", ImportUrl, app),
+        KeyBinding::new("enter", SubmitUrl, field),
+        KeyBinding::new("escape", CancelUrl, field),
         KeyBinding::new("secondary-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
