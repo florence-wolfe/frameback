@@ -48,6 +48,11 @@ impl VideoFormat {
         };
         format!("{}×{} @ {fps} {}", self.width, self.height, self.pixel)
     }
+
+    /// Height of the frames capture delivers in this format, after line doubling.
+    pub fn frame_height(&self) -> u32 {
+        if convert::line_doubled(self.width, self.height) { self.height * 2 } else { self.height }
+    }
 }
 
 /// Sorts formats best-first: widest, then tallest, then highest frame rate.
@@ -271,6 +276,13 @@ mod tests {
         let f = |fps| VideoFormat { width: 1920, height: 1080, fps, pixel: "yuvs".into() };
         assert_eq!(f(59.940179700658746).label(), "1920×1080 @ 59.94 yuvs");
         assert_eq!(f(60.0).label(), "1920×1080 @ 60 yuvs");
+    }
+
+    #[test]
+    fn recorded_height_matches_line_doubled_frames() {
+        let f = |w, h| VideoFormat { width: w, height: h, fps: 59.94, pixel: "yuvs".into() };
+        assert_eq!(f(720, 240).frame_height(), 480);
+        assert_eq!(f(1920, 1080).frame_height(), 1080);
     }
 
     #[test]

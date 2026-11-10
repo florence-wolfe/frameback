@@ -37,7 +37,7 @@ use objc2_core_video::{
 };
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 
-use super::convert::{Packed422, detect_packed_stride, packed422_to_bgra};
+use super::convert::{Packed422, detect_packed_stride, double_lines, packed422_to_bgra};
 use super::{FrameSlot, LatestFrame, VideoDevice, VideoEvent, VideoFormat, sort_formats};
 
 pub fn request_permission(on_complete: impl Fn(bool) + Send + Sync + 'static) {
@@ -288,7 +288,8 @@ unsafe fn copy_frame(sample: &CMSampleBuffer) -> Option<LatestFrame> {
     });
     unsafe { CVPixelBufferUnlockBaseAddress(&pixels, CVPixelBufferLockFlags::ReadOnly) };
 
-    let image = RgbaImage::from_raw(width as u32, height as u32, bgra?)?;
+    let (bgra, height) = double_lines(bgra?, width as u32, height as u32);
+    let image = RgbaImage::from_raw(width as u32, height, bgra)?;
     Some(LatestFrame {
         image: Arc::new(RenderImage::new([Frame::new(image)])),
         captured_at: unsafe { captured_at(sample) },

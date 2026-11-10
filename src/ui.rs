@@ -8,7 +8,7 @@ use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, Hsla,
-    IntoElement, MouseButton, ObjectFit, Pixels, RenderImage, SharedString, Task, Window, actions,
+    IntoElement, MouseButton, ObjectFit, Pixels, RenderImage, SharedString, Size, Task, Window, actions,
     canvas, deferred, div, img, prelude::*, px, rgb, rgba,
 };
 
@@ -69,6 +69,45 @@ enum Update {
     Downloading(Release),
     /// Downloaded and verified; installs when Frameback quits.
     Ready(Release, PathBuf),
+}
+
+/// The shape the picture is shown at. Capture cards deliver 720×480 for
+/// 4:3 and anamorphic 16:9 alike, so only the viewer knows which it is.
+#[derive(Clone, Copy, PartialEq)]
+enum Aspect {
+    /// Square pixels, as the frames arrive.
+    Captured,
+    Standard,
+    Wide,
+}
+
+impl Aspect {
+    const ALL: [Aspect; 3] = [Aspect::Captured, Aspect::Standard, Aspect::Wide];
+
+    fn label(self) -> &'static str {
+        match self {
+            Aspect::Captured => "As captured",
+            Aspect::Standard => "4:3",
+            Aspect::Wide => "16:9",
+        }
+    }
+
+    fn ratio(self) -> Option<f32> {
+        match self {
+            Aspect::Captured => None,
+            Aspect::Standard => Some(4.0 / 3.0),
+            Aspect::Wide => Some(16.0 / 9.0),
+        }
+    }
+}
+
+/// The largest size with the given aspect ratio that fits in `container`.
+fn fit(container: Size<Pixels>, ratio: f32) -> Size<Pixels> {
+    if container.width / container.height > ratio {
+        Size { width: container.height * ratio, height: container.height }
+    } else {
+        Size { width: container.width, height: container.width / ratio }
+    }
 }
 
 const JUMP_SECS: f64 = 5.0;
@@ -220,6 +259,7 @@ pub struct Frameback {
     toolbar_hovered: bool,
     hide_controls: Option<Task<()>>,
     show_stats: bool,
+    aspect: Aspect,
     stats: Stats,
     toast: Option<SharedString>,
     clear_toast: Option<Task<()>>,
@@ -327,6 +367,7 @@ impl Frameback {
             toolbar_hovered: false,
             hide_controls: None,
             show_stats: false,
+            aspect: Aspect::Captured,
             stats: Stats::default(),
             toast: update_failure,
             clear_toast: None,
@@ -545,6 +586,8 @@ impl Frameback {
         // HD60 S+ sends 29.97 while claiming 59.94); encode at the real rate.
         let measured = (self.stats.fps > 0.0).then_some(self.stats.fps as f64);
         format.fps = effective_fps(format.fps, measured);
+        // Encode frames at the size capture delivers them (240p is line-doubled).
+        format.height = format.frame_height();
         let audio_rate = self.monitor.as_ref().map(|m| m.sample_rate);
         let window = Duration::from_secs(self.dvr_window_min * 60);
         let (pipeline, taps) =
@@ -1328,7 +1371,7 @@ impl Render for Frameback {
             .text_color(text())
             .text_sm()
             .when(hide_cursor, |d| d.cursor(CursorStyle::None))
-            .child(self.render_video(cx))
+            .child(self.render_video(window, cx))
             .when(self.timeshift.is_some(), |d| {
                 // An unmistakable frame around the picture while reviewing.
                 let color = if self.editing_clip() { accent() } else { review_amber() };
@@ -1364,12 +1407,17 @@ impl Render for Frameback {
 }
 
 impl Frameback {
-    fn render_video(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_video(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.frame.current {
-            Some(frame) => img(frame.clone())
-                .size_full()
-                .object_fit(ObjectFit::Contain)
-                .into_any_element(),
+            // The picture fills the window, so the window is the box to fit.
+            Some(frame) => match self.aspect.ratio() {
+                Some(ratio) => {
+                    let size = fit(window.viewport_size(), ratio);
+                    img(frame.clone()).w(size.width).h(size.height).object_fit(ObjectFit::Fill)
+                }
+                None => img(frame.clone()).size_full().object_fit(ObjectFit::Contain),
+            }
+            .into_any_element(),
             None => div()
                 .text_color(muted_text())
                 .child(if self.video_devices.is_empty() {
@@ -1938,7 +1986,16 @@ impl Frameback {
                     action: Box::new(|_, window, cx| window.dispatch_action(Box::new(ToggleStats), cx)),
                 },
                 command("Fullscreen", Some("F".into()), ToggleFullscreen),
-            ],
+                MenuRow::Header("Aspect ratio"),
+            ]
+            .into_iter()
+            .chain(Aspect::ALL.iter().map(|&aspect| {
+                choice(aspect.label(), self.aspect == aspect, move |this, cx| {
+                    this.aspect = aspect;
+                    cx.notify();
+                })
+            }))
+            .collect(),
             Menu::Settings => std::iter::once(MenuRow::Header("Codec"))
                 .chain(Codec::ALL.iter().map(|&codec| {
                     let label = format!("{} (.{})", codec.label(), codec.extension());
@@ -2083,13 +2140,21 @@ fn button(id: &'static str, label: impl Into<SharedString>) -> gpui::Stateful<gp
 
 #[cfg(test)]
 mod tests {
-    use super::{ShownFrame, visible_range};
-    use gpui::RenderImage;
+    use super::{ShownFrame, fit, visible_range};
+    use gpui::{RenderImage, px, size};
     use image::{Frame, RgbaImage};
     use std::sync::Arc;
 
     fn image() -> Arc<RenderImage> {
         Arc::new(RenderImage::new([Frame::new(RgbaImage::new(1, 1))]))
+    }
+
+    #[test]
+    fn picture_fits_inside_the_window_at_its_aspect() {
+        // Wide window: full height, pillarboxed.
+        assert_eq!(fit(size(px(1000.0), px(600.0)), 4.0 / 3.0), size(px(800.0), px(600.0)));
+        // Tall window: full width, letterboxed.
+        assert_eq!(fit(size(px(400.0), px(900.0)), 16.0 / 9.0), size(px(400.0), px(225.0)));
     }
 
     #[test]

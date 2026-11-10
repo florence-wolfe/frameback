@@ -12,7 +12,7 @@ use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
 };
 
-use super::convert::{Packed422, packed422_to_bgra, rgba_to_bgra};
+use super::convert::{Packed422, double_lines, packed422_to_bgra, rgba_to_bgra};
 use super::{FrameSlot, LatestFrame, VideoDevice, VideoEvent, VideoFormat, sort_formats};
 
 pub fn request_permission(on_complete: impl Fn(bool) + Send + Sync + 'static) {
@@ -129,7 +129,8 @@ pub fn run(
             }
         }
 
-        let Some(pixels) = RgbaImage::from_raw(width, height, bgra) else {
+        let (bgra, frame_height) = double_lines(bgra, width, height);
+        let Some(pixels) = RgbaImage::from_raw(width, frame_height, bgra) else {
             continue;
         };
         let frame = LatestFrame {

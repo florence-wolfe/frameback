@@ -95,6 +95,28 @@ pub fn detect_packed_stride(src: &[u8], declared: usize, width: u32, height: u32
     if row_difference(packed) < row_difference(declared) { packed } else { declared }
 }
 
+/// Whether frames this size carry a 240p/288p picture (one field per frame,
+/// e.g. a retro console through a pass-through scaler at 720×240) that is meant
+/// to fill a 4:3 screen with every line shown twice.
+pub fn line_doubled(width: u32, height: u32) -> bool {
+    height <= 288 && width >= height * 2
+}
+
+/// Repeats every row of a BGRA frame that `line_doubled` matches, the way a TV
+/// or line doubler shows it; plain repetition keeps pixel edges sharp.
+/// Returns the frame and its height.
+pub fn double_lines(bgra: Vec<u8>, width: u32, height: u32) -> (Vec<u8>, u32) {
+    if !line_doubled(width, height) {
+        return (bgra, height);
+    }
+    let mut doubled = Vec::with_capacity(bgra.len() * 2);
+    for row in bgra.chunks_exact(width as usize * 4) {
+        doubled.extend_from_slice(row);
+        doubled.extend_from_slice(row);
+    }
+    (doubled, height * 2)
+}
+
 #[inline(always)]
 fn clamp(v: i32) -> u8 {
     (v >> 16).clamp(0, 255) as u8
@@ -187,6 +209,25 @@ mod tests {
     fn black_frame_keeps_declared_stride() {
         let buf = vec![0u8; 1472 * 481];
         assert_eq!(detect_packed_stride(&buf, 1472, 720, 480), 1472);
+    }
+
+    #[test]
+    fn low_line_count_frames_are_line_doubled() {
+        // 2×1 frame standing in for 720×240: wider than twice its height.
+        let row = [1, 2, 3, 255, 4, 5, 6, 255];
+        let (px, height) = double_lines(row.to_vec(), 2, 1);
+        assert_eq!(height, 2);
+        assert_eq!(&px[..8], &row);
+        assert_eq!(&px[8..], &row);
+    }
+
+    #[test]
+    fn which_frames_get_line_doubled() {
+        assert!(line_doubled(720, 240), "NTSC 240p");
+        assert!(line_doubled(720, 288), "PAL 288p");
+        assert!(!line_doubled(720, 480));
+        assert!(!line_doubled(1920, 1080));
+        assert!(!line_doubled(320, 240), "4:3 webcam mode");
     }
 
     #[test]
