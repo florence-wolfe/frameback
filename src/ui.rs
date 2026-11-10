@@ -136,6 +136,37 @@ fn visible_range(frozen: Option<(f64, f64)>, buffered: (f64, f64)) -> (f64, f64)
     }
 }
 
+/// The frame on screen. Replaced frames are freed from the GPU atlas one
+/// render later, so a frame still in flight on the GPU never has its texture
+/// reused under it. Frames replaced before any render drew them were never
+/// uploaded and are dropped at once: GPUI stops rendering a hidden window, but
+/// frames keep arriving, and keeping them all would grow memory without bound.
+#[derive(Default)]
+struct ShownFrame {
+    current: Option<Arc<RenderImage>>,
+    /// Whether a render has drawn `current`.
+    drawn: bool,
+    retired: Vec<Arc<RenderImage>>,
+    to_free: Vec<Arc<RenderImage>>,
+}
+
+impl ShownFrame {
+    fn show(&mut self, image: Arc<RenderImage>) {
+        if let Some(old) = self.current.replace(image)
+            && self.drawn
+        {
+            self.retired.push(old);
+        }
+        self.drawn = false;
+    }
+
+    /// Called at the start of each render; returns the images to drop from the atlas.
+    fn rendering(&mut self) -> Vec<Arc<RenderImage>> {
+        self.drawn = self.current.is_some();
+        std::mem::replace(&mut self.to_free, std::mem::take(&mut self.retired))
+    }
+}
+
 #[derive(Default)]
 struct Stats {
     /// `FrameSlot::delivered` at `since`.
@@ -157,11 +188,7 @@ pub struct Frameback {
     active_format: Option<VideoFormat>,
     capture: Option<Capture>,
 
-    frame: Option<Arc<RenderImage>>,
-    /// Replaced frames, freed from the GPU atlas one render later so a frame
-    /// still in flight on the GPU never has its texture reused under it.
-    retired: Vec<Arc<RenderImage>>,
-    to_free: Vec<Arc<RenderImage>>,
+    frame: ShownFrame,
 
     audio_devices: Vec<AudioDevice>,
     audio_selected: Option<usize>,
@@ -274,9 +301,7 @@ impl Frameback {
             formats: Vec::new(),
             active_format: None,
             capture: None,
-            frame: None,
-            retired: Vec::new(),
-            to_free: Vec::new(),
+            frame: ShownFrame::default(),
             audio_devices: audio::list_inputs(),
             audio_selected: None,
             monitor: None,
@@ -339,17 +364,11 @@ impl Frameback {
                 self.count_frame(cx);
                 // In timeshift (or with a file open) the live feed keeps recording but isn't shown.
                 if self.timeshift.is_none() && self.imported.is_none() {
-                    self.display(latest.image);
+                    self.frame.show(latest.image);
                 }
                 cx.notify();
             }
             VideoEvent::Error(err) => self.show_toast(err, cx),
-        }
-    }
-
-    fn display(&mut self, image: Arc<RenderImage>) {
-        if let Some(old) = self.frame.replace(image) {
-            self.retired.push(old);
         }
     }
 
@@ -948,7 +967,7 @@ impl Frameback {
 
     /// Puts the frame on screen on the clipboard as a PNG.
     fn copy_frame(&mut self, cx: &mut Context<Self>) {
-        let frame = self.frame.clone().filter(|_| self.editing_clip());
+        let frame = self.frame.current.clone().filter(|_| self.editing_clip());
         let Some(frame) = frame else {
             self.show_toast("Open Clip (C) to copy a frame", cx);
             return;
@@ -1006,7 +1025,7 @@ impl Frameback {
                 ts.time = time;
                 self.follow_playhead();
                 if let Some(frame) = self.playback_slot.take() {
-                    self.display(frame.image);
+                    self.frame.show(frame.image);
                 }
             }
             // Stay in review at the last frame; going live is always explicit.
@@ -1154,7 +1173,7 @@ impl Frameback {
     }
 
     fn screenshot(&mut self, _: &Screenshot, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(frame) = self.frame.clone() else {
+        let Some(frame) = self.frame.current.clone() else {
             self.show_toast("No frame to capture yet", cx);
             return;
         };
@@ -1270,10 +1289,9 @@ fn accent() -> Hsla {
 
 impl Render for Frameback {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        for image in self.to_free.drain(..) {
+        for image in self.frame.rendering() {
             let _ = window.drop_image(image);
         }
-        self.to_free = std::mem::take(&mut self.retired);
 
         let hide_cursor = !self.controls_visible && self.menu.is_none() && self.url_dialog.is_none();
 
@@ -1347,7 +1365,7 @@ impl Render for Frameback {
 
 impl Frameback {
     fn render_video(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match &self.frame {
+        let content = match &self.frame.current {
             Some(frame) => img(frame.clone())
                 .size_full()
                 .object_fit(ObjectFit::Contain)
@@ -2065,7 +2083,41 @@ fn button(id: &'static str, label: impl Into<SharedString>) -> gpui::Stateful<gp
 
 #[cfg(test)]
 mod tests {
-    use super::visible_range;
+    use super::{ShownFrame, visible_range};
+    use gpui::RenderImage;
+    use image::{Frame, RgbaImage};
+    use std::sync::Arc;
+
+    fn image() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new([Frame::new(RgbaImage::new(1, 1))]))
+    }
+
+    #[test]
+    fn frames_never_drawn_are_not_kept() {
+        // A hidden window stops rendering, but capture keeps delivering frames.
+        let mut frame = ShownFrame::default();
+        let first = image();
+        let first_weak = Arc::downgrade(&first);
+        frame.show(first);
+        for _ in 0..100 {
+            frame.show(image());
+        }
+        assert!(first_weak.upgrade().is_none(), "an undrawn frame was kept");
+    }
+
+    #[test]
+    fn drawn_frames_are_freed_one_render_later() {
+        let mut frame = ShownFrame::default();
+        let first = image();
+        frame.show(first.clone());
+        assert!(frame.rendering().is_empty());
+        frame.show(image());
+        // Replaced, but the GPU may still be drawing it.
+        assert!(frame.rendering().is_empty());
+        let freed = frame.rendering();
+        assert_eq!(freed.len(), 1);
+        assert!(Arc::ptr_eq(&freed[0], &first));
+    }
 
     #[test]
     fn frozen_timeline_ignores_new_footage() {
