@@ -212,8 +212,14 @@ pub fn run(
     }
     let _ = events.unbounded_send(VideoEvent::Opened { formats, active: wanted });
 
-    // Frames arrive on the dispatch queue; this thread just waits to be stopped.
-    let _ = stop.recv();
+    // Frames arrive on the dispatch queue; this thread waits to be stopped,
+    // watching for the device being unplugged.
+    while let Err(mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(Duration::from_millis(500)) {
+        if !unsafe { av_device.isConnected() } {
+            let _ = events.unbounded_send(VideoEvent::Disconnected);
+            break;
+        }
+    }
     unsafe {
         session.stopRunning();
         output.setSampleBufferDelegate_queue(None, None);

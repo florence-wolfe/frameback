@@ -101,6 +101,17 @@ impl Aspect {
     }
 }
 
+const DEVICE_POLL: Duration = Duration::from_secs(2);
+
+/// Where `wanted` is in `devices`: by ID, or by name, since a device plugged
+/// back into another port gets a new ID.
+fn find_device(devices: &[VideoDevice], wanted: &VideoDevice) -> Option<usize> {
+    devices
+        .iter()
+        .position(|d| d.id == wanted.id)
+        .or_else(|| devices.iter().position(|d| d.name == wanted.name))
+}
+
 /// The largest size with the given aspect ratio that fits in `container`.
 fn fit(container: Size<Pixels>, ratio: f32) -> Size<Pixels> {
     if container.width / container.height > ratio {
@@ -223,6 +234,8 @@ pub struct Frameback {
 
     video_devices: Vec<VideoDevice>,
     video_selected: Option<usize>,
+    /// An unplugged device to capture from again once it's back.
+    reconnect: Option<VideoDevice>,
     formats: Vec<VideoFormat>,
     active_format: Option<VideoFormat>,
     capture: Option<Capture>,
@@ -338,6 +351,7 @@ impl Frameback {
             slot: Arc::default(),
             video_devices: Vec::new(),
             video_selected: None,
+            reconnect: None,
             formats: Vec::new(),
             active_format: None,
             capture: None,
@@ -381,6 +395,17 @@ impl Frameback {
     fn on_video_event(&mut self, event: VideoEvent, cx: &mut Context<Self>) {
         match event {
             VideoEvent::Permission(true) => {
+                // Notice devices being plugged in and back in.
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(DEVICE_POLL).await;
+                        let devices = cx.background_executor().spawn(async { video::list_devices() }).await;
+                        if this.update(cx, |this, cx| this.devices_listed(devices, cx)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
                 self.video_devices = video::list_devices();
                 if self.video_devices.is_empty() {
                     self.show_toast("No capture devices found", cx);
@@ -392,6 +417,7 @@ impl Frameback {
                 self.show_toast("Camera access denied — allow it in system privacy settings", cx);
             }
             VideoEvent::Opened { formats, active } => {
+                self.reconnect = None;
                 self.formats = formats;
                 self.active_format = Some(active);
                 self.auto_select_audio(cx);
@@ -409,7 +435,53 @@ impl Frameback {
                 }
                 cx.notify();
             }
-            VideoEvent::Error(err) => self.show_toast(err, cx),
+            VideoEvent::Error(err) => {
+                // A device that was just plugged back in can still be settling; retry.
+                if self.reconnect.is_some() {
+                    self.capture = None;
+                }
+                self.show_toast(err, cx);
+            }
+            VideoEvent::Disconnected => {
+                if let Some(device) = self.video_selected.map(|i| self.video_devices[i].clone()) {
+                    self.device_lost(device, cx);
+                }
+            }
+        }
+    }
+
+    fn device_lost(&mut self, device: VideoDevice, cx: &mut Context<Self>) {
+        if self.reconnect.is_none() {
+            self.show_toast(format!("{} disconnected — waiting for it", device.name), cx);
+        }
+        self.capture = None;
+        self.reconnect = Some(device);
+    }
+
+    /// Keeps the device menu current, and resumes capture from a device that
+    /// was unplugged (or the first one, if there was none) once it's back.
+    fn devices_listed(&mut self, devices: Vec<VideoDevice>, cx: &mut Context<Self>) {
+        let selected = self.video_selected.map(|i| self.video_devices[i].clone());
+        if devices.iter().map(|d| &d.id).ne(self.video_devices.iter().map(|d| &d.id)) {
+            // Only the exact device counts as still here; a namesake means a replug.
+            self.video_selected = selected.as_ref().and_then(|s| devices.iter().position(|d| d.id == s.id));
+            self.video_devices = devices;
+            if let (None, Some(gone)) = (self.video_selected, selected.clone()) {
+                self.device_lost(gone, cx);
+            }
+            cx.notify();
+        }
+        // Restarting capture clears the rewind buffer; wait until review ends.
+        if self.capture.is_some() || self.timeshift.is_some() || self.imported.is_some() {
+            return;
+        }
+        let resume = match (&self.reconnect, selected) {
+            (Some(lost), _) => find_device(&self.video_devices, lost),
+            (None, None) if !self.video_devices.is_empty() => Some(0),
+            _ => None,
+        };
+        if let Some(index) = resume {
+            self.select_video(index, cx);
         }
     }
 
@@ -2140,13 +2212,27 @@ fn button(id: &'static str, label: impl Into<SharedString>) -> gpui::Stateful<gp
 
 #[cfg(test)]
 mod tests {
-    use super::{ShownFrame, fit, visible_range};
+    use super::{ShownFrame, find_device, fit, visible_range};
+    use crate::video::VideoDevice;
     use gpui::{RenderImage, px, size};
     use image::{Frame, RgbaImage};
     use std::sync::Arc;
 
     fn image() -> Arc<RenderImage> {
         Arc::new(RenderImage::new([Frame::new(RgbaImage::new(1, 1))]))
+    }
+
+    #[test]
+    fn reconnected_device_is_found_by_id_then_name() {
+        let device = |id: &str, name: &str| VideoDevice { id: id.into(), name: name.into() };
+        let card = device("0x2400000fd9006a", "Game Capture HD60 S+");
+        let devices = [device("cam", "FaceTime HD Camera"), device("0x12400000fd9006a", "Game Capture HD60 S+")];
+        // Plugged back into another port: new ID, same name.
+        assert_eq!(find_device(&devices, &card), Some(1));
+        // Same port: the ID wins even if another device shares the name.
+        let devices = [device("other", "Game Capture HD60 S+"), card.clone()];
+        assert_eq!(find_device(&devices, &card), Some(1));
+        assert_eq!(find_device(&devices[..1], &device("gone", "Cam Link 4K")), None);
     }
 
     #[test]

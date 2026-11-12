@@ -82,6 +82,8 @@ pub enum VideoEvent {
     },
     /// A new frame is waiting in the slot. Sent at most once until the UI takes it.
     FrameReady,
+    /// The device was unplugged; capture has stopped.
+    Disconnected,
     Error(String),
 }
 

@@ -105,7 +105,11 @@ pub fn run(
     let (width, height) = (active.width(), active.height());
     let mut rgba = Vec::new();
     while !stopped(stop) {
-        let buffer = camera.frame().context("reading frame")?;
+        // A stream that stops delivering has almost always been unplugged.
+        let Ok(buffer) = camera.frame() else {
+            let _ = events.unbounded_send(VideoEvent::Disconnected);
+            break;
+        };
         if stopped(stop) {
             break;
         }
