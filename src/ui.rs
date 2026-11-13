@@ -29,6 +29,7 @@ actions!(
         Screenshot,
         ToggleMute,
         ToggleStats,
+        ToggleOverlays,
         ToggleRecord,
         TogglePlay,
         StepBack,
@@ -272,6 +273,8 @@ pub struct Frameback {
     toolbar_hovered: bool,
     hide_controls: Option<Task<()>>,
     show_stats: bool,
+    /// Nothing is drawn over the picture: no toolbar, badge, border or stats.
+    hide_overlays: bool,
     aspect: Aspect,
     stats: Stats,
     toast: Option<SharedString>,
@@ -381,6 +384,7 @@ impl Frameback {
             toolbar_hovered: false,
             hide_controls: None,
             show_stats: false,
+            hide_overlays: false,
             aspect: Aspect::Captured,
             stats: Stats::default(),
             toast: update_failure,
@@ -632,6 +636,8 @@ impl Frameback {
     fn exit_fullscreen(&mut self, _: &ExitFullscreen, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
+        } else if self.hide_overlays {
+            self.toggle_overlays(&ToggleOverlays, window, cx);
         } else if self.editing_clip() {
             self.toggle_clip_mode(cx);
         } else if window.is_fullscreen() {
@@ -1287,6 +1293,17 @@ impl Frameback {
         cx.notify();
     }
 
+    fn toggle_overlays(&mut self, _: &ToggleOverlays, _: &mut Window, cx: &mut Context<Self>) {
+        self.hide_overlays = !self.hide_overlays;
+        self.menu = None;
+        if self.hide_overlays {
+            self.show_toast("Overlays hidden — H or Esc to show them", cx);
+        } else {
+            self.toast = None;
+        }
+        cx.notify();
+    }
+
     fn screenshot(&mut self, _: &Screenshot, _: &mut Window, cx: &mut Context<Self>) {
         let Some(frame) = self.frame.current.clone() else {
             self.show_toast("No frame to capture yet", cx);
@@ -1409,6 +1426,7 @@ impl Render for Frameback {
         }
 
         let hide_cursor = !self.controls_visible && self.menu.is_none() && self.url_dialog.is_none();
+        let overlays = !self.hide_overlays;
 
         div()
             .id("root")
@@ -1418,6 +1436,7 @@ impl Render for Frameback {
             .on_action(cx.listener(Self::exit_fullscreen))
             .on_action(cx.listener(Self::toggle_mute))
             .on_action(cx.listener(Self::toggle_stats))
+            .on_action(cx.listener(Self::toggle_overlays))
             .on_action(cx.listener(Self::screenshot))
             .on_action(cx.listener(Self::toggle_record))
             .on_action(cx.listener(Self::toggle_play))
@@ -1444,13 +1463,13 @@ impl Render for Frameback {
             .text_sm()
             .when(hide_cursor, |d| d.cursor(CursorStyle::None))
             .child(self.render_video(window, cx))
-            .when(self.timeshift.is_some(), |d| {
+            .when(overlays && self.timeshift.is_some(), |d| {
                 // An unmistakable frame around the picture while reviewing.
                 let color = if self.editing_clip() { accent() } else { review_amber() };
                 d.child(div().absolute().inset_0().border_2().border_color(color))
             })
-            .children(self.render_mode_badge())
-            .when(self.show_stats, |d| d.child(self.render_stats()))
+            .when(overlays, |d| d.children(self.render_mode_badge()))
+            .when(overlays && self.show_stats, |d| d.child(self.render_stats()))
             .when_some(self.toast.clone(), |d, toast| d.child(render_toast(toast)))
             .when(self.menu.is_some(), |d| {
                 d.child(
@@ -1471,7 +1490,7 @@ impl Render for Frameback {
                     .with_priority(1),
                 )
             })
-            .when(self.controls_visible || self.menu.is_some() || self.timeshift.is_some(), |d| {
+            .when(overlays && (self.controls_visible || self.menu.is_some() || self.timeshift.is_some()), |d| {
                 d.child(self.render_toolbar(cx))
             })
             .children(self.url_dialog.clone().map(|input| self.render_url_dialog(input, cx)))
@@ -2057,6 +2076,7 @@ impl Frameback {
                     shortcut: Some("I".into()),
                     action: Box::new(|_, window, cx| window.dispatch_action(Box::new(ToggleStats), cx)),
                 },
+                command("Hide overlays", Some("H".into()), ToggleOverlays),
                 command("Fullscreen", Some("F".into()), ToggleFullscreen),
                 MenuRow::Header("Aspect ratio"),
             ]
@@ -2342,6 +2362,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("s", Screenshot, app),
         KeyBinding::new("m", ToggleMute, app),
         KeyBinding::new("i", ToggleStats, app),
+        KeyBinding::new("h", ToggleOverlays, app),
         KeyBinding::new("r", ToggleRecord, app),
         KeyBinding::new("space", TogglePlay, app),
         KeyBinding::new("left", StepBack, app),

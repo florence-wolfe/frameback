@@ -13,9 +13,10 @@ Always use `--release` for real use; debug builds add conversion latency.
 | Key | Action |
 | --- | --- |
 | `F` / double-click | Toggle fullscreen |
-| `Esc` | Close menu / exit fullscreen |
+| `Esc` | Close menu / show hidden overlays / exit fullscreen |
 | `M` | Mute audio monitor |
 | `I` | Stats overlay (fps, capture→UI latency) |
+| `H` | Hide/show everything drawn over the picture (toolbar, timeline, badge, review border, stats) for a clean view while stepping frames |
 | `S` | Screenshot to `~/Pictures` |
 | `R` | Start/stop recording to `~/Movies` (`~/Videos` on Windows/Linux) |
 | `Space` | Pause/play (pausing live enters review on the newest frame) |
@@ -30,7 +31,7 @@ Always use `--release` for real use; debug builds add conversion latency.
 | `Cmd+Shift+O` / `Ctrl+Shift+O` | Import a video from a URL |
 | `L` / `End` | Back to live (closes an imported file, returning to where you were) |
 
-Controls hide after 2.5 s without mouse movement. The toolbar holds recording, the capture device, format and audio; everything else is in its menus: **File** (import a file or URL, screenshot), **View** (stats, fullscreen) and **Settings** (codec, rewind buffer length).
+Controls hide after 2.5 s without mouse movement. The toolbar holds recording, the capture device, format and audio; everything else is in its menus: **File** (import a file or URL, screenshot), **View** (stats, hide overlays, fullscreen) and **Settings** (codec, rewind buffer length).
 
 ## How latency is kept low
 
