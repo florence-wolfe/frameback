@@ -83,6 +83,14 @@ Recordings include the capture card's audio (PCM for FFV1/ProRes, AAC for HEVC/H
 
 Recording runs on its own thread and never delays the live preview; if the encoder can't keep up, frames are dropped from the file (reported when it's saved) rather than from the screen. Files are written at the rate the device actually delivers, which can be lower than advertised.
 
+## Control API
+
+Frameback listens on `127.0.0.1:47800` for JSON-over-HTTP commands, so a Stream Deck plugin or script can do everything the toolbar and keyboard can (record, review, step, mark and save clips, change devices…) and read the app's state to draw buttons. Set `FRAMEBACK_API_PORT` to change the port, or `off` to disable it. See [docs/control-api.md](docs/control-api.md).
+
+```sh
+curl -X POST localhost:47800/v1/record -d '{"on":true}'
+```
+
 ## Releases and updates
 
 Download the latest build from GitHub Releases (macOS Apple Silicon `.zip`, Windows `.zip`, Linux `.tar.gz`); each bundles its own FFmpeg. On first launch, macOS blocks the app because it isn't notarized (it's self-signed): open **System Settings → Privacy & Security** and click **Open Anyway** next to the Frameback message. Later updates install without asking again.

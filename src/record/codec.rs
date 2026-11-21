@@ -15,6 +15,16 @@ pub enum Codec {
 impl Codec {
     pub const ALL: [Codec; 4] = [Codec::Ffv1, Codec::ProRes, Codec::Hevc, Codec::H264];
 
+    /// The name the control API uses.
+    pub fn id(self) -> &'static str {
+        match self {
+            Codec::Ffv1 => "ffv1",
+            Codec::ProRes => "prores",
+            Codec::Hevc => "hevc",
+            Codec::H264 => "h264",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Codec::Ffv1 => "Lossless (FFV1)",

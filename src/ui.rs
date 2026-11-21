@@ -6,12 +6,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
+use serde_json::{Value, json};
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, Hsla,
     IntoElement, MouseButton, ObjectFit, Pixels, RenderImage, SharedString, Size, Task, Window, actions,
     canvas, deferred, div, img, prelude::*, px, rgb, rgba,
 };
 
+use crate::api::{self, ApiError, Command, ImportFrom, Reply};
 use crate::audio::{self, AudioDevice, AudioTap, Monitor, Volume};
 use crate::update::{self, Release};
 use crate::record::{
@@ -88,6 +90,15 @@ impl Aspect {
     fn label(self) -> &'static str {
         match self {
             Aspect::Captured => "As captured",
+            Aspect::Standard => "4:3",
+            Aspect::Wide => "16:9",
+        }
+    }
+
+    /// The name the control API uses.
+    fn id(self) -> &'static str {
+        match self {
+            Aspect::Captured => "captured",
             Aspect::Standard => "4:3",
             Aspect::Wide => "16:9",
         }
@@ -280,6 +291,7 @@ pub struct Frameback {
     toast: Option<SharedString>,
     clear_toast: Option<Task<()>>,
     _events_task: Task<()>,
+    _api_task: Option<Task<()>>,
     _pipeline_task: Task<()>,
     _player_task: Task<()>,
     _quit: gpui::Subscription,
@@ -347,6 +359,10 @@ impl Frameback {
         // Left by the install script if the last update couldn't be installed.
         let update_failure = update::take_failure_notice()
             .map(|why| SharedString::from(format!("The last update failed: {why}")));
+        let (api_task, api_failure) = match Self::start_api(window, cx) {
+            Ok(task) => (task, None),
+            Err(why) => (None, Some(SharedString::from(why))),
+        };
 
         Self {
             focus,
@@ -387,9 +403,10 @@ impl Frameback {
             hide_overlays: false,
             aspect: Aspect::Captured,
             stats: Stats::default(),
-            toast: update_failure,
+            toast: update_failure.or(api_failure),
             clear_toast: None,
             _events_task: events_task,
+            _api_task: api_task,
             _pipeline_task: pipeline_task,
             _player_task: player_task,
             _quit: quit,
@@ -510,16 +527,20 @@ impl Frameback {
         }
     }
 
+    /// Why `action` is refused: it would discard the buffer being reviewed.
+    fn review_block(&self, action: &str) -> Option<ApiError> {
+        if self.imported.is_some() {
+            return Some(ApiError::conflict(format!("Close the imported file (L) before {action}")));
+        }
+        self.timeshift.is_some().then(|| {
+            ApiError::conflict(format!("Go LIVE (L) before {action}: it would clear the rewind buffer"))
+        })
+    }
+
     /// True (and explains why) if `action` would discard the buffer being reviewed.
     fn blocked_in_review(&mut self, action: &str, cx: &mut Context<Self>) -> bool {
-        if self.imported.is_some() {
-            self.show_toast(format!("Close the imported file (L) before {action}"), cx);
-            return true;
-        }
-        if self.timeshift.is_none() {
-            return false;
-        }
-        self.show_toast(format!("Go LIVE (L) before {action}: it would clear the rewind buffer"), cx);
+        let Some(err) = self.review_block(action) else { return false };
+        self.show_toast(err.message, cx);
         true
     }
 
@@ -646,6 +667,13 @@ impl Frameback {
     }
 
     fn toggle_mute(&mut self, _: &ToggleMute, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_muted(self.muted_volume.is_none(), cx);
+    }
+
+    fn set_muted(&mut self, mute: bool, cx: &mut Context<Self>) {
+        if mute == self.muted_volume.is_some() {
+            return;
+        }
         match self.muted_volume.take() {
             Some(v) => self.volume.set(v),
             None => {
@@ -740,24 +768,34 @@ impl Frameback {
     }
 
     fn toggle_record(&mut self, _: &ToggleRecord, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(dvr) = &self.dvr else {
-            self.show_toast("Nothing to record yet", cx);
-            return;
-        };
-        if self.recording.take().is_some() {
-            dvr.pipeline.stop_recording();
-        } else if self.imported.is_some() {
-            self.show_toast("Close the imported file (L) to start recording", cx);
-            return;
-        } else if self.timeshift.is_some() {
-            // Recording takes the live feed, not what's being reviewed.
-            self.show_toast("Go LIVE (L) to start recording", cx);
-            return;
-        } else {
+        if let Err(err) = self.set_recording(self.recording.is_none(), cx) {
+            self.show_toast(err.message, cx);
+        }
+    }
+
+    fn set_recording(&mut self, on: bool, cx: &mut Context<Self>) -> Result<(), ApiError> {
+        if !on {
+            if self.recording.take().is_some()
+                && let Some(dvr) = &self.dvr
+            {
+                dvr.pipeline.stop_recording();
+            }
+        } else if self.recording.is_none() {
+            let Some(dvr) = &self.dvr else {
+                return Err(ApiError::unavailable("Nothing to record yet"));
+            };
+            if self.imported.is_some() {
+                return Err(ApiError::conflict("Close the imported file (L) to start recording"));
+            }
+            if self.timeshift.is_some() {
+                // Recording takes the live feed, not what's being reviewed.
+                return Err(ApiError::conflict("Go LIVE (L) to start recording"));
+            }
             dvr.pipeline.record(output_path(MOVIES_DIR, "frameback", self.codec.extension()), Instant::now());
             self.recording = Some(Recording { started: Instant::now() });
         }
         cx.notify();
+        Ok(())
     }
 
     fn select_codec(&mut self, codec: Codec, cx: &mut Context<Self>) {
@@ -1021,6 +1059,14 @@ impl Frameback {
         cx.notify();
     }
 
+    fn clear_marks(&mut self, cx: &mut Context<Self>) {
+        if let Some(ts) = &mut self.timeshift {
+            ts.clip_start = None;
+            ts.clip_end = None;
+        }
+        cx.notify();
+    }
+
     /// The clip to save: the marked range, defaulting to the buffer's ends.
     fn clip_range(&self) -> Option<(f64, f64)> {
         let ts = self.timeshift.as_ref().filter(|ts| ts.editing_clip)?;
@@ -1028,16 +1074,15 @@ impl Frameback {
         Some((ts.clip_start.unwrap_or(oldest), ts.clip_end.unwrap_or(newest)))
     }
 
-    /// Writes the clip to `dir` in the background. None (with a hint) outside clip mode.
+    /// Writes the clip to `dir` in the background. Refused outside clip mode.
     fn export_clip(
         &mut self,
         dir: &str,
         verb: &str,
         cx: &mut Context<Self>,
-    ) -> Option<(PathBuf, Task<anyhow::Result<u64>>)> {
+    ) -> Result<(PathBuf, Task<anyhow::Result<u64>>), ApiError> {
         let (Some((from, to)), Some(store)) = (self.clip_range(), self.store().cloned()) else {
-            self.show_toast(format!("Open Clip (C) to {verb} a clip"), cx);
-            return None;
+            return Err(ApiError::conflict(format!("Open Clip (C) to {verb} a clip")));
         };
         let codec = self.codec;
         let path = output_path(dir, "frameback-clip", codec.extension());
@@ -1045,70 +1090,98 @@ impl Frameback {
             let path = path.clone();
             async move { crate::record::save_clip(&store, codec, from, to, path) }
         });
-        Some((path, task))
+        Ok((path, task))
+    }
+
+    /// Lets a started task finish on its own; if it couldn't start, says why.
+    fn detach(&mut self, started: Result<Task<anyhow::Result<Value>>, ApiError>, cx: &mut Context<Self>) {
+        match started {
+            Ok(task) => task.detach(),
+            Err(err) => self.show_toast(err.message, cx),
+        }
     }
 
     fn save_clip(&mut self, cx: &mut Context<Self>) {
-        let Some((path, task)) = self.export_clip(MOVIES_DIR, "save", cx) else { return };
+        let started = self.start_save_clip(cx);
+        self.detach(started, cx);
+    }
+
+    /// The task ends once the clip is written, with its path and frame count.
+    fn start_save_clip(&mut self, cx: &mut Context<Self>) -> Result<Task<anyhow::Result<Value>>, ApiError> {
+        let (path, task) = self.export_clip(MOVIES_DIR, "save", cx)?;
         self.show_toast("Saving clip…", cx);
-        cx.spawn(async move |this, cx| {
-            let message = match task.await {
+        Ok(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let message = match &result {
                 Ok(frames) => format!("Saved clip {} ({frames} frames)", path.display()),
                 Err(err) => format!("Saving clip failed: {err:#}"),
             };
             let _ = this.update(cx, |this, cx| this.show_toast(message, cx));
-        })
-        .detach();
+            result.map(|frames| json!({ "path": path.to_string_lossy(), "frames": frames }))
+        }))
+    }
+
+    fn copy_clip(&mut self, cx: &mut Context<Self>) {
+        let started = self.start_copy_clip(cx);
+        self.detach(started, cx);
     }
 
     /// Exports the clip to a temp file and puts that file on the clipboard.
-    fn copy_clip(&mut self, cx: &mut Context<Self>) {
+    fn start_copy_clip(&mut self, cx: &mut Context<Self>) -> Result<Task<anyhow::Result<Value>>, ApiError> {
         let dir = copied_clips_dir();
-        let Some((path, task)) = self.export_clip(&dir, "copy", cx) else { return };
+        let (path, task) = self.export_clip(&dir, "copy", cx)?;
         self.show_toast("Copying clip…", cx);
-        cx.spawn(async move |this, cx| {
+        Ok(cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                let message = match result {
-                    Ok(frames) if crate::clipboard::copy_file(&path) => {
-                        format!("Copied clip ({frames} frames). Paste it anywhere that takes files")
-                    }
-                    Ok(_) => {
+            this.update(cx, |this, cx| {
+                let (message, result) = match result {
+                    Ok(frames) if crate::clipboard::copy_file(&path) => (
+                        format!("Copied clip ({frames} frames). Paste it anywhere that takes files"),
+                        Ok(json!({ "frames": frames })),
+                    ),
+                    Ok(frames) => {
                         let text = path.to_string_lossy().into_owned();
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                        "Copied the clip's file path (copying files isn't supported here yet)".into()
+                        (
+                            "Copied the clip's file path (copying files isn't supported here yet)".into(),
+                            Ok(json!({ "frames": frames })),
+                        )
                     }
-                    Err(err) => format!("Copying clip failed: {err:#}"),
+                    Err(err) => (format!("Copying clip failed: {err:#}"), Err(err)),
                 };
                 this.show_toast(message, cx);
-            });
-        })
-        .detach();
+                result
+            })?
+        }))
+    }
+
+    fn copy_frame(&mut self, cx: &mut Context<Self>) {
+        let started = self.start_copy_frame(cx);
+        self.detach(started, cx);
     }
 
     /// Puts the frame on screen on the clipboard as a PNG.
-    fn copy_frame(&mut self, cx: &mut Context<Self>) {
+    fn start_copy_frame(&mut self, cx: &mut Context<Self>) -> Result<Task<anyhow::Result<Value>>, ApiError> {
         let frame = self.frame.current.clone().filter(|_| self.editing_clip());
         let Some(frame) = frame else {
-            self.show_toast("Open Clip (C) to copy a frame", cx);
-            return;
+            return Err(ApiError::conflict("Open Clip (C) to copy a frame"));
         };
         let task = cx.background_executor().spawn(async move { encode_png(&frame) });
-        cx.spawn(async move |this, cx| {
+        Ok(cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                let message = match result {
+            this.update(cx, |this, cx| {
+                let (message, result) = match result {
                     Ok(png) => {
                         let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
                         cx.write_to_clipboard(gpui::ClipboardItem::new_image(&image));
-                        "Copied frame".to_string()
+                        ("Copied frame".to_string(), Ok(Value::Null))
                     }
-                    Err(err) => format!("Copying frame failed: {err:#}"),
+                    Err(err) => (format!("Copying frame failed: {err:#}"), Err(err)),
                 };
                 this.show_toast(message, cx);
-            });
-        })
-        .detach();
+                result
+            })?
+        }))
     }
 
     /// The timeline's current span (see `visible_range`).
@@ -1305,24 +1378,347 @@ impl Frameback {
     }
 
     fn screenshot(&mut self, _: &Screenshot, _: &mut Window, cx: &mut Context<Self>) {
+        let started = self.start_screenshot(cx);
+        self.detach(started, cx);
+    }
+
+    /// The task ends once the file is written, with its path.
+    fn start_screenshot(&mut self, cx: &mut Context<Self>) -> Result<Task<anyhow::Result<Value>>, ApiError> {
         let Some(frame) = self.frame.current.clone() else {
-            self.show_toast("No frame to capture yet", cx);
-            return;
+            return Err(ApiError::unavailable("No frame to capture yet"));
         };
         let path = output_path(PICTURES_DIR, "frameback", "png");
         let task = cx.background_executor().spawn({
             let path = path.clone();
             async move { save_png(&frame, &path) }
         });
-        cx.spawn(async move |this, cx| {
-            let message = match task.await {
+        Ok(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let message = match &result {
                 Ok(()) => format!("Saved {}", path.display()),
                 Err(err) => format!("Screenshot failed: {err:#}"),
             };
             let _ = this.update(cx, |this, cx| this.show_toast(message, cx));
-        })
-        .detach();
+            result.map(|()| json!({ "path": path.to_string_lossy() }))
+        }))
     }
+}
+
+/// What running a command came to: an answer now, or one once a file is written.
+enum Outcome {
+    Done(Reply),
+    Later(Task<Reply>),
+}
+
+// --- Control API -------------------------------------------------------------
+
+impl Frameback {
+    /// Starts the control API unless it's turned off. Err says why it couldn't.
+    fn start_api(window: &Window, cx: &mut Context<Self>) -> Result<Option<Task<()>>, String> {
+        let Some(port) = api::configured_port()? else { return Ok(None) };
+        let (_, mut requests) = api::serve(port)
+            .map_err(|err| format!("Control API can't listen on port {port}: {err}"))?;
+        Ok(Some(cx.spawn_in(window, async move |this, cx| {
+            while let Some(request) = requests.next().await {
+                let handled = this.update_in(cx, |this, window, cx| {
+                    match this.run_command(request.command, window, cx) {
+                        Outcome::Done(reply) => {
+                            let _ = request.reply.send(reply);
+                        }
+                        // Don't hold up other requests (status polls) while a file is written.
+                        Outcome::Later(task) => cx
+                            .spawn(async move |_, _| {
+                                let _ = request.reply.send(task.await);
+                            })
+                            .detach(),
+                    }
+                });
+                if handled.is_err() {
+                    break;
+                }
+            }
+        })))
+    }
+
+    fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) -> Outcome {
+        let started = match command {
+            Command::Screenshot => self.start_screenshot(cx),
+            Command::SaveClip => self.start_save_clip(cx),
+            Command::CopyClip => self.start_copy_clip(cx),
+            Command::CopyFrame => self.start_copy_frame(cx),
+            other => return Outcome::Done(self.run_now(other, window, cx)),
+        };
+        match started {
+            Ok(task) => Outcome::Later(cx.spawn(async move |_, _| {
+                task.await.map_err(|err| ApiError::failed(format!("{err:#}")))
+            })),
+            Err(err) => Outcome::Done(Err(err)),
+        }
+    }
+
+    /// Runs a command that finishes at once. Its reply holds any fields to add to the response.
+    fn run_now(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) -> Reply {
+        match command {
+            Command::Status => return Ok(self.status(window)),
+            Command::Options => return Ok(self.options()),
+            Command::Record(on) => self.set_recording(on.unwrap_or(self.recording.is_none()), cx)?,
+            Command::Mute(on) => self.set_muted(on.unwrap_or(self.muted_volume.is_none()), cx),
+            Command::Stats(on) => {
+                self.show_stats = on.unwrap_or(!self.show_stats);
+                cx.notify();
+            }
+            Command::HideOverlays(on) => {
+                if on.unwrap_or(!self.hide_overlays) != self.hide_overlays {
+                    self.toggle_overlays(&ToggleOverlays, window, cx);
+                }
+            }
+            Command::Fullscreen(on) => {
+                if on.unwrap_or(!window.is_fullscreen()) != window.is_fullscreen() {
+                    window.toggle_fullscreen();
+                }
+            }
+            Command::Play(on) => {
+                // Live counts as playing: pausing it is what enters review.
+                let playing = self.timeshift.as_ref().is_none_or(|ts| ts.playing);
+                if on.is_none_or(|on| on != playing) {
+                    self.toggle_play(&TogglePlay, window, cx);
+                    if on == Some(false) && self.timeshift.is_none() {
+                        return Err(ApiError::unavailable("Nothing buffered yet"));
+                    }
+                }
+            }
+            Command::Live => self.go_live(cx),
+            Command::Step(frames) => {
+                if frames == 0 {
+                    return Err(ApiError::bad_request("\"frames\" can't be 0"));
+                }
+                self.require_buffer()?;
+                self.step(frames, cx);
+            }
+            Command::StepSize(frames) => {
+                if !STEP_SIZES.contains(&frames) {
+                    return Err(ApiError::bad_request(format!("\"frames\" must be one of {STEP_SIZES:?}")));
+                }
+                self.step_frames = frames;
+                cx.notify();
+            }
+            Command::Jump(seconds) => {
+                self.require_buffer()?;
+                self.jump(seconds, cx);
+            }
+            Command::Seek(seconds) => {
+                let (start, _) = self.timeline_range().ok_or_else(nothing_buffered)?;
+                self.seek(start + seconds, cx);
+            }
+            Command::Clip(on) => {
+                if on.unwrap_or(!self.editing_clip()) != self.editing_clip() {
+                    self.toggle_clip_mode(cx);
+                    if on != Some(false) && !self.editing_clip() {
+                        return Err(nothing_buffered());
+                    }
+                }
+            }
+            Command::MarkStart | Command::MarkEnd => {
+                self.require_clip_mode("mark")?;
+                self.mark(command == Command::MarkStart, cx);
+            }
+            Command::ClearMarks => {
+                self.require_clip_mode("clear the marks of")?;
+                self.clear_marks(cx);
+            }
+            Command::Import(from) => {
+                let source = match from {
+                    ImportFrom::File(path) if path.is_file() => Source::File(path),
+                    ImportFrom::File(path) => {
+                        return Err(ApiError::not_found(format!("no such file: {}", path.display())));
+                    }
+                    ImportFrom::Url(url) if looks_like_url(&url) => {
+                        Source::Url { url, into: output_dir(MOVIES_DIR) }
+                    }
+                    ImportFrom::Url(_) => {
+                        return Err(ApiError::bad_request("\"url\" must start with http:// or https://"));
+                    }
+                };
+                self.begin_import(source, cx);
+            }
+            Command::VideoDevice(id) => {
+                let index = self
+                    .video_devices
+                    .iter()
+                    .position(|d| d.id == id)
+                    .ok_or_else(|| ApiError::not_found(format!("no video device with id {id:?}")))?;
+                if self.video_selected != Some(index) || self.capture.is_none() {
+                    self.refuse_in_review("switching devices")?;
+                    self.select_video(index, cx);
+                }
+            }
+            Command::Format(label) => {
+                let format = self
+                    .formats
+                    .iter()
+                    .find(|f| f.label() == label)
+                    .cloned()
+                    .ok_or_else(|| ApiError::not_found(format!("no format labelled {label:?}")))?;
+                if self.active_format.as_ref() != Some(&format) {
+                    self.refuse_in_review("changing format")?;
+                    self.select_format(format, cx);
+                }
+            }
+            Command::AudioDevice(name) => {
+                let index = match name {
+                    None => None,
+                    Some(name) => Some(
+                        self.audio_devices
+                            .iter()
+                            .position(|d| d.name == name)
+                            .ok_or_else(|| ApiError::not_found(format!("no audio device named {name:?}")))?,
+                    ),
+                };
+                if self.audio_selected != index {
+                    self.refuse_in_review("changing audio input")?;
+                    self.select_audio(index, cx);
+                }
+            }
+            Command::Codec(id) => {
+                let codec = Codec::ALL
+                    .into_iter()
+                    .find(|c| c.id() == id)
+                    .ok_or_else(|| ApiError::not_found(format!("no codec with id {id:?}")))?;
+                if codec != self.codec {
+                    self.refuse_in_review("changing codec")?;
+                    self.select_codec(codec, cx);
+                }
+            }
+            Command::Buffer(minutes) => {
+                if !DVR_WINDOWS_MIN.contains(&minutes) {
+                    return Err(ApiError::bad_request(format!("\"minutes\" must be one of {DVR_WINDOWS_MIN:?}")));
+                }
+                if minutes != self.dvr_window_min {
+                    self.refuse_in_review("resizing the buffer")?;
+                    self.select_dvr_window(minutes, cx);
+                }
+            }
+            Command::Aspect(id) => {
+                self.aspect = Aspect::ALL
+                    .into_iter()
+                    .find(|a| a.id() == id)
+                    .ok_or_else(|| ApiError::not_found(format!("no aspect ratio with id {id:?}")))?;
+                cx.notify();
+            }
+            Command::Screenshot | Command::SaveClip | Command::CopyClip | Command::CopyFrame => {
+                unreachable!("run_command starts these")
+            }
+        }
+        Ok(Value::Null)
+    }
+
+    fn refuse_in_review(&self, action: &str) -> Result<(), ApiError> {
+        self.review_block(action).map_or(Ok(()), Err)
+    }
+
+    fn require_buffer(&self) -> Result<(), ApiError> {
+        self.buffered().map(|_| ()).ok_or_else(nothing_buffered)
+    }
+
+    fn require_clip_mode(&self, verb: &str) -> Result<(), ApiError> {
+        if self.editing_clip() {
+            Ok(())
+        } else {
+            Err(ApiError::conflict(format!("Open Clip (C) to {verb} a clip")))
+        }
+    }
+
+    /// Everything a controller needs to draw its buttons. Times are seconds
+    /// from the start of the timeline, as the timeline shows them.
+    fn status(&self, window: &Window) -> Value {
+        let review = self.timeshift.as_ref();
+        let range = self.timeline_range();
+        let origin = range.map_or(0.0, |(start, _)| start);
+        let mode = if self.editing_clip() {
+            "clip"
+        } else if review.is_some() {
+            "review"
+        } else if self.imported.is_some() {
+            "import"
+        } else {
+            "live"
+        };
+        json!({
+            "version": update::VERSION,
+            "mode": mode,
+            "playing": review.is_some_and(|ts| ts.playing),
+            "recording": self.recording.as_ref().map(|r| json!({ "seconds": r.started.elapsed().as_secs_f64() })),
+            "timeline": range.map(|(start, end)| json!({
+                "length": end - start,
+                "position": review.map_or(end, |ts| ts.time) - start,
+            })),
+            "clip": review.filter(|ts| ts.editing_clip).map(|ts| json!({
+                "start": ts.clip_start.map(|t| t - origin),
+                "end": ts.clip_end.map(|t| t - origin),
+            })),
+            "file": self.imported.as_ref().map(|i| json!({
+                "name": i.name,
+                "downloading": i.downloading,
+                "progress": i.progress,
+                "ready": i.store.is_some(),
+            })),
+            "capture": {
+                "active": self.capture.is_some(),
+                "waiting_for_device": self.reconnect.is_some(),
+                "device": self.video_selected.map(|i| device_json(&self.video_devices[i])),
+                "format": self.active_format.as_ref().map(VideoFormat::label),
+                "fps": self.stats.fps,
+                "latency_ms": self.stats.latency_ms,
+            },
+            "audio": {
+                "device": self.audio_selected.map(|i| &self.audio_devices[i].name),
+                "muted": self.muted_volume.is_some(),
+            },
+            "settings": {
+                "codec": self.codec.id(),
+                "buffer_minutes": self.dvr_window_min,
+                "step_frames": self.step_frames,
+                "aspect": self.aspect.id(),
+            },
+            "view": {
+                "fullscreen": window.is_fullscreen(),
+                "stats": self.show_stats,
+                "overlays_hidden": self.hide_overlays,
+            },
+            "message": self.toast,
+        })
+    }
+
+    /// What each setting can be set to.
+    fn options(&self) -> Value {
+        json!({
+            "video_devices": self.video_devices.iter().map(device_json).collect::<Vec<_>>(),
+            "formats": self.formats.iter().map(|f| json!({
+                "label": f.label(),
+                "width": f.width,
+                "height": f.height,
+                "fps": f.fps,
+                "pixel": f.pixel,
+            })).collect::<Vec<_>>(),
+            "audio_devices": self.audio_devices.iter().map(|d| json!({ "name": d.name })).collect::<Vec<_>>(),
+            "codecs": Codec::ALL.iter().map(|c| json!({
+                "id": c.id(),
+                "label": c.label(),
+                "extension": c.extension(),
+            })).collect::<Vec<_>>(),
+            "buffer_minutes": DVR_WINDOWS_MIN,
+            "step_frames": STEP_SIZES,
+            "aspects": Aspect::ALL.iter().map(|a| json!({ "id": a.id(), "label": a.label() })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+fn device_json(device: &VideoDevice) -> Value {
+    json!({ "id": device.id, "name": device.name })
+}
+
+fn nothing_buffered() -> ApiError {
+    ApiError::unavailable("Nothing buffered yet")
 }
 
 const PICTURES_DIR: &str = "Pictures";
@@ -1997,15 +2393,9 @@ impl Frameback {
                 cx.listener(|this, _, _, cx| this.mark(false, cx)),
             ))
             .children((start.is_some() || end.is_some()).then(|| {
-                button("clear-marks", "✕").text_color(muted_text()).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        if let Some(ts) = &mut this.timeshift {
-                            ts.clip_start = None;
-                            ts.clip_end = None;
-                        }
-                        cx.notify();
-                    },
-                ))
+                button("clear-marks", "✕")
+                    .text_color(muted_text())
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_marks(cx)))
             }))
             .child(div().flex_1().font_family("monospace").text_color(muted_text()).children(summary))
             .child(button("copy-frame", "Copy frame").on_click(cx.listener(|this, _, _, cx| this.copy_frame(cx))))
